@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (C) 2026 Alexander Larsson
+# See COPYING for the full license text.
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import unittest
+
+LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
+PRIVATE_CRUN = os.environ.get("QM_TEST_PRIVATE_CRUN") == "1"
+sys.argv = sys.argv[:1]
+
+
+class ExecTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="qm-exec-")
+        self.addCleanup(self.temp.cleanup)
+        self.directory = pathlib.Path(self.temp.name)
+        self.runtime = self.directory / "runtime"
+        state = self.runtime / "crun/qm"
+        state.mkdir(parents=True)
+        for path in (self.runtime / "config.json", self.runtime / "netns", state / "status"):
+            path.write_text("existing runtime state\n")
+        self.crun = self.directory / "crun"
+        self.crun.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "print(json.dumps({'argv': sys.argv[1:], "
+            "'stdin': None if os.isatty(0) else sys.stdin.read()}))\n"
+            "sys.exit(23)\n")
+        self.crun.chmod(0o755)
+        if PRIVATE_CRUN:
+            subprocess.run(["mount", "--bind", str(self.crun), "/usr/bin/crun"], check=True)
+            self.addCleanup(subprocess.run, ["umount", "/usr/bin/crun"], check=True)
+
+    def command(self, *args):
+        return [str(LAUNCHER), "--runtime-dir", str(self.runtime), *args]
+
+    @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
+    def test_exec_arguments_stdio_and_status(self):
+        arguments = ["/bin/bash", "-c", "printf '%s' \"$1\"", "--", "two words",
+                     "--runtime-dir", "relative", "--help"]
+        result = subprocess.run(self.command("--exec", *arguments),
+                                input="piped input\n", text=True, capture_output=True)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["argv"],
+                         ["--root", str(self.runtime / "crun"),
+                          "--cgroup-manager=cgroupfs", "exec", "qm", *arguments])
+        self.assertEqual(output["stdin"], "piped input\n")
+        for path in self.runtime.rglob("*"):
+            if path.is_file():
+                self.assertEqual(path.read_text(), "existing runtime state\n")
+
+    @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
+    def test_exec_terminal(self):
+        master, slave = os.openpty()
+        self.addCleanup(os.close, master)
+        try:
+            result = subprocess.run(self.command("--exec", "/bin/bash"),
+                                    stdin=slave, stdout=slave, stderr=subprocess.PIPE)
+        finally:
+            os.close(slave)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        output = json.loads(os.read(master, 4096))
+        self.assertEqual(output["argv"][-3:], ["--tty", "qm", "/bin/bash"])
+        self.assertIsNone(output["stdin"])
+
+    @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
+    def test_exec_separator(self):
+        result = subprocess.run(self.command("--exec", "--", "/bin/true"),
+                                input="", text=True, capture_output=True)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["argv"][-2:], ["qm", "/bin/true"])
+
+    def test_runtime_directory_environment(self):
+        (self.runtime / "crun/qm/status").unlink()
+        environment = {**os.environ, "RUNTIME_DIRECTORY": str(self.runtime)}
+        result = subprocess.run(
+            [str(LAUNCHER), "--cleanup"], text=True, capture_output=True, env=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.runtime / "netns").exists())
+        (self.runtime / "netns").touch()
+        result = subprocess.run(self.command("--cleanup"), text=True, capture_output=True,
+                                env={**environment, "RUNTIME_DIRECTORY": "/wrong-runtime"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.runtime / "netns").exists())
+
+    def test_exec_missing_command_and_conflicting_modes(self):
+        cases = [
+            (["--exec"], "--exec requires a command"),
+            (["--exec", "--"], "--exec requires a command"),
+            (["--cleanup", "--exec", "/bin/bash"], "--exec cannot be combined"),
+            (["--prepare-only", "--exec", "/bin/bash"], "--exec cannot be combined"),
+        ]
+        for arguments, message in cases:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(self.command(*arguments), text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
+    def test_exec_missing_crun_preserves_state(self):
+        self.crun.write_text("#!/missing-interpreter\n")
+        result = subprocess.run(
+            self.command("--exec", "/bin/bash"),
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exec /usr/bin/crun", result.stderr)
+        self.assertTrue((self.runtime / "netns").exists())
+        self.assertTrue((self.runtime / "crun/qm/status").exists())
+
+
+unittest.main()

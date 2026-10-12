@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (C) 2026 Alexander Larsson
+# See COPYING for the full license text.
+
+[Unit]
+Description=QM container
+Wants=qm2-resolv-conf.path
+RequiresMountsFor=/usr/lib/qm/rootfs /etc/qm /var/qm
+
+[Service]
+# Override service settings with a systemd drop-in for qm2.service.
+# See systemd.resource-control(5) for the resource controls below.
+Type=exec
+
+# Delegate resource control to QM's nested container manager. Keep the launcher
+# in supervisor so crun can create the sibling payload cgroup for the container.
+Delegate=yes
+DelegateSubgroup=supervisor
+
+# Make QM a top-level cgroup, so its CPU weight is compared with user.slice and
+# system.slice. In another slice, it would only be compared with that slice's
+# other children.
+Slice=-.slice
+# Give QM idle CPU weight and a lower block I/O weight.
+CPUWeight=idle
+IOWeight=50
+# Allow systemd-oomd to act on this cgroup under swap pressure.
+ManagedOOMSwap=kill
+
+# No hard ceiling on memory usage; QM can use as much as the system allows.
+MemoryMax=infinity
+# No memory usage threshold at which MemoryHigh throttles the service.
+MemoryHigh=infinity
+# Prevent QM's processes from using swap.
+MemorySwapMax=0
+# Raise the OOM score of QM's processes, making them preferred kernel OOM victims.
+OOMScoreAdjust=500
+Restart=always
+SyslogIdentifier=%N
+
+# ROOTFS is the QM root filesystem. RWETCFS and RWVARFS provide the writable
+# /etc and /var trees; /var/tmp uses ${RWVARFS}/tmp.
+Environment=ROOTFS=/usr/lib/qm/rootfs
+Environment=RWETCFS=/etc/qm
+Environment=RWVARFS=/var/qm
+# Forward an explicit TZ override. The base config also binds host /etc/localtime.
+PassEnvironment=TZ
+
+# Use a separate runtime directory so this service can sit alongside qm.service.
+RuntimeDirectory=qm
+RuntimeDirectoryMode=0700
+
+# Container policy is defined in qm.json:
+# - Grant the captured capability set, excluding CAP_SYS_BOOT and CAP_SYS_RESOURCE.
+#   Broad capabilities allow nested workloads but reduce container isolation.
+# - Disable the container's own PID limit (linux.resources.pids.limit=-1).
+#   The service-wide TasksMax below still applies.
+# - Keep the root filesystem read-only, with writable /dev, /dev/shm, /tmp and
+#   /run tmpfs mounts and the writable bind mounts described above.
+# - Set fs.mqueue.queues_max=4 to limit POSIX message queues in the container.
+#   A sizing estimate is RLIMIT_MSGQUEUE / (msg_max * msgsize_max) / 2, where
+#   msg_max is the messages per queue and msgsize_max is the message size.
+#   The final factor of two leaves headroom for FFI workloads.
+# The seccomp profile comes from the installed QM package.
+ExecStart=@BINDIR@/qm-launch --hostname qm --rootfs ${ROOTFS} --etc-dir ${RWETCFS} --var-dir ${RWVARFS} --seccomp /usr/share/qm/seccomp-no-rt.json @DATADIR@/qm.json
+# Delete surviving crun state, tear down networking and unpin the namespace,
+# including when startup fails.
+ExecStopPost=@BINDIR@/qm-launch --cleanup
+
+# Signal foreground crun, which forwards SIGRTMIN+3 to the container's systemd
+# for orderly shutdown. Kill remaining service processes after the timeout.
+KillMode=mixed
+KillSignal=SIGRTMIN+3
+TimeoutStopSec=10s
+LimitNOFILE=65536
+LimitNPROC=1048576
+# Cap tasks across the service, including nested workloads, at 50% of the
+# system's task limit, even though the container's own PID limit is disabled.
+TasksMax=50%
+
+# IOReadIOPSMax, IOWriteIOPSMax
+# ----------------------------
+# Optional per-device limits on block I/O operations per second for QM.
+# Select the host block device backing /var/qm. K, M, G and T suffixes use
+# powers of 1000 (KiloIOPS, MegaIOPS, etc.). Configure these in a drop-in:
+# IOReadIOPSMax=/dev/sdf 50
+# IOWriteIOPSMax=/dev/sdf 50
+
+[Install]
+WantedBy=default.target

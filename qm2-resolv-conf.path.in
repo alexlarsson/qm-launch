@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (C) 2026 Alexander Larsson
+# See COPYING for the full license text.
+
+[Unit]
+Description=Watch QM host DNS and hosts configuration
+# qm2.service starts after basic.target; avoid the implicit Before=paths.target.
+DefaultDependencies=no
+BindsTo=qm2.service
+PartOf=qm2.service
+After=qm2.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Path]
+PathModified=/etc/resolv.conf
+PathModified=/etc/hosts
+# The launcher prefers this upstream file when systemd-resolved supplies it.
+PathModified=/run/systemd/resolve/resolv.conf

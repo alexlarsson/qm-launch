@@ -1,0 +1,129 @@
+qm-launch is an experimental podman-less launcher for the qm
+container, using crun directly. The intent is to be smaller and boot
+faster. Currently it is pretty hardcoded for the needs of qm, and is
+not flexible enough for any kind of generic use.
+
+
+Build and install:
+
+```sh
+meson setup build --prefix=/usr
+meson compile -C build
+meson test -C build --print-errorlogs
+sudo meson install -C build
+sudo systemctl daemon-reload
+```
+
+The installed `qm2.service` sits alongside the existing `qm.service`,
+so that this can install in parallel with the regular qm quadlet.
+
+The defaults use `qm` as hostname and OCI container ID and `/run/qm`
+for runtime files. When set, `RUNTIME_DIRECTORY` supplies the runtime path;
+systemd sets it from the service's `RuntimeDirectory` setting. `--runtime-dir`
+overrides that path. The launcher generates its default network
+configuration. The base config is supplied as a positional argument.
+For example, this may be the ExecStart option:
+
+```sh
+qm-launch --hostname qm --seccomp seccomp-no-rt.json qm.json
+```
+
+Run a command in the running container with `--exec`. For an interactive shell
+in the container started by `qm2.service`:
+
+```sh
+sudo qm-launch --exec /bin/bash
+```
+
+All arguments after `--exec` belong to the command, including options:
+
+```sh
+sudo qm-launch --exec /bin/bash -c 'systemctl status'
+```
+
+User namespaces are automatic when both `/etc/subuid` and `/etc/subgid` contain
+a `qm_root` range, as produced by QM's `userns enable` helper at image build
+time. The launcher maps container ID zero to the start of each range and uses
+the recorded range size. With neither entry, it launches without a user
+namespace. A partial or invalid configuration fails before crun starts.
+`--userns off` disables detection; `--userns required` fails when no ranges
+exist. User namespace
+operation with the QM rootfs, bind mounts and SELinux policy still needs a
+live integration test.
+
+`--seccomp` accepts OCI JSON or the supplied containers-style profile. The
+latter's `archMap` and `includes`/`excludes` conditions are resolved against
+the host architecture and the configured bounding capabilities. Conditions
+other than `arches` and `caps` are rejected. Without this option, the base
+config's inline seccomp filter is retained. The supplied `qm.json` contains
+only the static configuration and requires `--seccomp`; the service supplies
+it. Hostname, cgroup path, network namespace path, and generated mount sources
+are filled in by the launcher. The resulting OCI bundle is written as
+`/run/qm/config.json` when launched by `qm2.service`.
+
+The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/localtime`
+bind mount, which is omitted when its source is missing. Runtime setup replaces
+Podman's generated mount sources and removes
+`container_uuid`. Systemd starts the launcher in
+the service's `supervisor` subgroup. The launcher strips that component from
+its cgroup path, and crun creates the sibling `payload` cgroup.
+The container retains its cgroup namespace and writable cgroup mount.
+
+The service's namespace is pinned at `/run/qm/netns`. Netavark takes care of bridge,
+veth, addresses, routes, forwarding and NAT. The default configuration uses
+bridge `qm-br0`, subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
+`10.90.0.2`. The generated configuration is written to the runtime directory as
+`network.json` for Netavark's setup and teardown commands.
+The bridge provides connectivity while QM keeps one stable static IPv4 address.
+DNS proxying is disabled. `--resolv-conf`
+selects a file to copy; the default uses systemd-resolved's upstream file when
+available, otherwise `/etc/resolv.conf`. A missing resolver file produces an
+empty container resolver file. Nameservers must be reachable from
+the container, so a host loopback resolver is unsuitable.
+
+`qm2.service` starts `qm2-resolv-conf.path`, which watches `/etc/resolv.conf`,
+`/etc/hosts` and systemd-resolved's upstream file. Changes trigger
+`qm2-resolv-conf.service` to run `qm-launch --update-resolv-conf`. It updates
+`/run/qm/files/resolv.conf` and `/run/qm/files/hosts` in place so the container's
+bind mounts see the new contents. Shorter contents are padded with spaces before
+truncation. The hosts file retains the generated gateway and container hostname
+entries, including a custom hostname set at startup. Missing source or runtime
+files are left alone. The watcher stops with `qm2.service`.
+For manual runs, invoke `--update-resolv-conf` with the same `--runtime-dir`
+and `--resolv-conf` overrides used at startup.
+
+The service uses `KillMode=mixed` and `KillSignal=SIGRTMIN+3`: systemd signals
+foreground crun, which forwards the signal to container PID 1 for orderly
+shutdown. After ten seconds systemd kills any remaining service processes.
+`ExecStopPost` calls `qm-launch --cleanup` to delete surviving crun state,
+tear down networking, and unpin the namespace, including after startup failure.
+The launcher also attempts cleanup if setup or exec fails. For manual runs,
+invoke `--cleanup` after crun exits, using the same `--runtime-dir` if overridden.
+Use one launcher per runtime directory.
+Avoid systemd filesystem/network namespace sandbox options: cleanup must see
+the namespace mount created during startup. The service reports process
+startup, without a container readiness notification protocol.
+
+Inspect the generated bundle without privileged setup:
+
+```sh
+build/qm-launch --prepare-only --runtime-dir /tmp/qm-preview \
+    --hostname qm --seccomp seccomp-no-rt.json qm.json
+```
+
+This writes the bundle and files, without changing namespaces or cgroups or
+applying SELinux labels.
+
+The optional live smoke test runs with temporary user, mount and network
+namespaces, plus a delegated transient user service. It exercises cgroup
+delegation, Netavark, foreground crun, graceful shutdown and cleanup; it uses
+a small test init, rather than the QM rootfs or its SELinux policy. It uses
+`tests/seccomp-no-rt.json` and disables host subid detection for the live launch.
+Device and subid preparation tests use private `/dev` and `/etc` mounts:
+
+```sh
+systemd-run --user --service-type=exec --pipe --wait --collect --same-dir \
+    -p Delegate=yes -p DelegateSubgroup=supervisor \
+    unshare --user --map-root-user --net --mount \
+    python3 tests/smoke.py build/qm-launch
+```

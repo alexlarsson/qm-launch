@@ -1,0 +1,109 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (C) 2026 Alexander Larsson
+ * See COPYING for the full license text.
+ */
+
+#pragma once
+
+#include <json-c/json.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#define N_ELEMENTS(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define autofree __attribute__((cleanup(cleanup_free)))
+#define autoclose __attribute__((cleanup(cleanup_close)))
+#define autofreejson __attribute__((cleanup(js_cleanup_json)))
+
+static inline void cleanup_free(void *p)
+{
+	free(*(void **)p);
+}
+
+static inline void cleanup_close(const int *fd)
+{
+	/* Linux releases the descriptor even when close() returns EINTR. */
+	if (*fd >= 0)
+		close(*fd);
+}
+
+static inline void *steal_ptr(void *p)
+{
+	void **pp = p;
+	void *result = *pp;
+
+	*pp = NULL;
+
+	return result;
+}
+
+void oom(void) __attribute__((noreturn));
+void *xmalloc(size_t size) __attribute__((malloc, alloc_size(1)));
+void *xrealloc(void *ptr, size_t size) __attribute__((alloc_size(2)));
+char *xstrdup(const char *string) __attribute__((malloc));
+char *xasprintf(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+bool starts_with(const char *string, const char *prefix);
+char *join_path(const char *a, const char *b);
+
+char *read_text_file(const char *filename);
+/* Return NULL with errno set on open/read failure. */
+char *try_read_text_file(const char *filename);
+void write_all(int fd, const char *data, size_t length);
+void ensure_private_directory(const char *name);
+void write_text_file(const char *name, const char *contents);
+void set_selinux_label(const char *name, const char *context);
+
+typedef struct {
+	bool found;
+	uint32_t start;
+	uint32_t count;
+} IdRange;
+
+/* Return .found=false when the file or username has no subordinate-ID range. */
+IdRange read_subid(const char *directory, const char *filename,
+		   const char *username);
+
+/* Return an allocated path for the calling process's cgroup v2 membership. */
+char *get_current_cgroup(void);
+
+bool ns_is_mounted(const char *path);
+
+/* Return 0 on success, 1 on failure. Set *file_created when the namespace
+ * file was created, even if a later step failed; the caller must clean it up.
+ */
+int create_net_ns(const char *path, bool *file_created);
+
+/* Return exit status (128 + signal if killed), or -1 with errno on failure.
+ * These helpers do not exit, so cleanup can continue after an error. */
+int wait_child(pid_t child);
+
+/* Also report fork, exec and wait errors on stderr. */
+int run_command(char *const argv[]);
+
+void js_cleanup_json(void *p);
+
+/* Constructors and js_load return owned references. Getters return borrowed
+ * references; string pointers remain valid while their JSON value is alive.
+ * js_object_add and js_array_add consume the supplied reference. */
+json_object *js_new_int(int64_t value);
+json_object *js_new_bool(bool value);
+json_object *js_new_strings(const char *const values[], size_t count);
+json_object *js_new_string(const char *value);
+json_object *js_new_array(void);
+json_object *js_new_object(void);
+
+void js_object_add(json_object *object, const char *key, json_object *value);
+void js_array_add(json_object *array, json_object *value);
+
+json_object *js_get(json_object *object, const char *key);
+json_object *js_need(json_object *object, const char *key, enum json_type type);
+const char *js_array_string(json_object *array, size_t index);
+const char *js_string(json_object *object, const char *key);
+void js_set_string(json_object *object, const char *key, const char *value);
+
+json_object *js_load(const char *filename);
+void js_save(json_object *object, const char *filename);
+bool js_contains(json_object *array, const char *value);

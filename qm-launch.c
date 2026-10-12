@@ -1,0 +1,1007 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later
+ * Copyright (C) 2026 Alexander Larsson
+ * See COPYING for the full license text.
+ */
+
+#define _GNU_SOURCE
+#include "config.h"
+#include "qm-utils.h"
+
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <json-c/json.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+
+#define QM_CONTAINER_ID "qm"
+#define QM_SUBID_USER "qm_root"
+#define QM_IP "10.90.0.2"
+#define QM_GATEWAY "10.90.0.1"
+#define SUPERVISOR_CGROUP "supervisor"
+#define PAYLOAD_CGROUP "payload"
+
+#define DEFAULT_HOSTNAME "qm"
+#define DEFAULT_RUNTIME_DIR "/run/qm"
+#define CRUN "/usr/bin/crun"
+#define NETAVARK "/usr/libexec/podman/netavark"
+
+typedef enum { USERNS_AUTO, USERNS_OFF, USERNS_REQUIRED } UserNamespaceMode;
+
+typedef struct {
+	const char *base_config;
+	const char *hostname;
+	const char *rootfs;
+	const char *etc_dir;
+	const char *var_dir;
+
+	const char *seccomp_file;
+	const char *resolv_conf;
+
+	const char *runtime_dir;
+	UserNamespaceMode userns;
+
+	bool prepare_only;
+	bool cleanup_only;
+	bool update_resolv_conf;
+	char **exec_argv; /* Borrowed from main's argv, NULL-terminated. */
+} Options;
+
+static int netavark(const Options *options, const char *action)
+{
+	autofree char *netavark_state =
+		join_path(options->runtime_dir, "netavark");
+	autofree char *network_config =
+		join_path(options->runtime_dir, "network.json");
+	autofree char *netns = join_path(options->runtime_dir, "netns");
+	char *argv[] = {(char *)NETAVARK,
+			"--rootless=false",
+			"--config",
+			netavark_state,
+			"--file",
+			network_config,
+			(char *)action,
+			netns,
+			NULL};
+
+	return run_command(argv);
+}
+
+static int crun_delete(const Options *options)
+{
+	autofree char *crun_state = join_path(options->runtime_dir, "crun");
+	autofree char *container = join_path(crun_state, QM_CONTAINER_ID);
+	autofree char *container_status = join_path(container, "status");
+	if (access(container_status, F_OK) != 0)
+		return 0;
+
+	char *argv[] = {CRUN,	  "--root",  crun_state,
+			"delete", "--force", (char *)QM_CONTAINER_ID,
+			NULL};
+
+	return run_command(argv);
+}
+
+static int teardown_network(const Options *options)
+{
+	autofree char *netns = join_path(options->runtime_dir, "netns");
+	int result = 0;
+
+	if (ns_is_mounted(netns)) {
+		result |= netavark(options, "teardown");
+
+		if (umount(netns) < 0) {
+			warn("umount %s", netns);
+			return 1;
+		}
+
+		if (unlink(netns) < 0) {
+			warn("unlink %s", netns);
+			result = 1;
+		}
+	} else if (unlink(netns) < 0 && errno != ENOENT) {
+		warn("unlink %s", netns);
+		result = 1;
+	}
+
+	return result != 0;
+}
+
+static int cleanup(const Options *options)
+{
+	int result = crun_delete(options);
+	result |= teardown_network(options);
+
+	return result != 0;
+}
+
+static int setup_network(const Options *options, bool *netns_file_created)
+{
+	autofree char *netns = join_path(options->runtime_dir, "netns");
+	if (create_net_ns(netns, netns_file_created))
+		return 1;
+
+	if (netavark(options, "setup")) {
+		warnx("Netavark setup failed");
+		return 1;
+	}
+
+	return 0;
+}
+
+static int crun_run(const Options *options)
+{
+	autofree char *crun_state = join_path(options->runtime_dir, "crun");
+	char *argv[] = {CRUN,
+			"--root",
+			crun_state,
+			"--cgroup-manager=cgroupfs",
+			"run",
+			"--bundle",
+			(char *)options->runtime_dir,
+			(char *)QM_CONTAINER_ID,
+			NULL};
+
+	execv(CRUN, argv);
+	warn("exec %s", CRUN);
+
+	return 1;
+}
+
+static int exec_in_container(const Options *options)
+{
+	autofree char *crun_state = join_path(options->runtime_dir, "crun");
+	char *prefix[] = {CRUN, "--root", crun_state,
+			  "--cgroup-manager=cgroupfs", "exec"};
+	size_t command_count = 0;
+	while (options->exec_argv[command_count])
+		command_count++;
+
+	autofree char **argv = xmalloc(
+		(N_ELEMENTS(prefix) + command_count + 3) * sizeof(*argv));
+	memcpy(argv, prefix, sizeof(prefix));
+	size_t index = N_ELEMENTS(prefix);
+	if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
+		argv[index++] = "--tty";
+	argv[index++] = (char *)QM_CONTAINER_ID;
+	memcpy(argv + index, options->exec_argv,
+	       (command_count + 1) * sizeof(*argv));
+
+	execv(CRUN, argv);
+	warn("exec %s", CRUN);
+
+	return 1;
+}
+
+static char *cgroup_parent(bool prepare_only)
+{
+	autofree char *cgroup = get_current_cgroup();
+
+	char *subgroup = strrchr(cgroup, '/');
+	if (subgroup && !strcmp(subgroup + 1, SUPERVISOR_CGROUP))
+		*subgroup = '\0';
+	else if (!prepare_only)
+		errx(1,
+		     "service requires Delegate=yes and "
+		     "DelegateSubgroup=%s",
+		     SUPERVISOR_CGROUP);
+
+	if (!prepare_only && (!*cgroup || !strcmp(cgroup, "/")))
+		errx(1, "run inside a delegated systemd service");
+
+	return steal_ptr(&cgroup);
+}
+
+typedef struct {
+	const char *kernel_name;
+	const char *containers_name;
+	const char *seccomp_name;
+} Architecture;
+
+static const Architecture *native_arch(void)
+{
+	static const Architecture architectures[] = {
+		{"x86_64", "amd64", "SCMP_ARCH_X86_64"},
+		{"aarch64", "arm64", "SCMP_ARCH_AARCH64"},
+		{"i686", "x86", "SCMP_ARCH_X86"},
+		{"armv7l", "arm", "SCMP_ARCH_ARM"},
+		{"ppc64le", "ppc64le", "SCMP_ARCH_PPC64LE"},
+		{"s390x", "s390x", "SCMP_ARCH_S390X"},
+		{"riscv64", "riscv64", "SCMP_ARCH_RISCV64"},
+	};
+
+	struct utsname host;
+	if (uname(&host) < 0)
+		err(1, "uname");
+
+	for (size_t i = 0; i < N_ELEMENTS(architectures); i++)
+		if (!strcmp(host.machine, architectures[i].kernel_name))
+			return &architectures[i];
+
+	errx(1, "unsupported seccomp architecture: %s", host.machine);
+}
+
+static bool seccomp_condition_matches(json_object *condition, json_object *caps,
+				      const char *arch, bool include)
+{
+	if (!condition)
+		return true;
+	if (!json_object_is_type(condition, json_type_object))
+		errx(1, "invalid seccomp condition");
+
+	json_object_object_foreach (condition, key, value) {
+		if (strcmp(key, "arches") && strcmp(key, "caps"))
+			errx(1, "unsupported seccomp condition: %s", key);
+		if (!json_object_is_type(value, json_type_array))
+			errx(1, "invalid seccomp condition: %s", key);
+	}
+
+	json_object *arches = js_get(condition, "arches");
+	if (arches && json_object_array_length(arches) &&
+	    js_contains(arches, arch) != include)
+		return false;
+
+	json_object *required = js_get(condition, "caps");
+	if (required)
+		for (size_t i = 0; i < json_object_array_length(required); i++)
+			if (js_contains(caps, js_array_string(required, i)) !=
+			    include)
+				return false;
+
+	return true;
+}
+
+static void resolve_seccomp(json_object *profile, json_object *process)
+{
+	const Architecture *arch = native_arch();
+	json_object *caps = js_get(js_get(process, "capabilities"), "bounding");
+
+	json_object *map = js_get(profile, "archMap");
+	if (map) {
+		if (!json_object_is_type(map, json_type_array))
+			errx(1, "invalid seccomp archMap");
+
+		autofreejson json_object *architectures = js_new_array();
+		js_array_add(architectures, js_new_string(arch->seccomp_name));
+		for (size_t i = 0; i < json_object_array_length(map); i++) {
+			json_object *entry = json_object_array_get_idx(map, i);
+			if (strcmp(js_string(entry, "architecture"),
+				   arch->seccomp_name))
+				continue;
+
+			json_object *sub = js_need(entry, "subArchitectures",
+						   json_type_array);
+			for (size_t j = 0; j < json_object_array_length(sub);
+			     j++)
+				js_array_add(architectures,
+					     json_object_get(
+						     json_object_array_get_idx(
+							     sub, j)));
+		}
+
+		js_object_add(profile, "architectures",
+			      steal_ptr(&architectures));
+		json_object_object_del(profile, "archMap");
+	}
+
+	if (js_get(profile, "defaultErrno") &&
+	    !js_get(profile, "defaultErrnoRet"))
+		errx(1,
+		     "seccomp defaultErrno requires numeric defaultErrnoRet");
+	json_object_object_del(profile, "defaultErrno");
+
+	json_object *rules = js_need(profile, "syscalls", json_type_array);
+	autofreejson json_object *filtered = js_new_array();
+	for (size_t i = 0; i < json_object_array_length(rules); i++) {
+		json_object *rule = json_object_array_get_idx(rules, i);
+		if (!seccomp_condition_matches(js_get(rule, "includes"), caps,
+					       arch->containers_name, true) ||
+		    !seccomp_condition_matches(js_get(rule, "excludes"), caps,
+					       arch->containers_name, false))
+			continue;
+
+		if (js_get(rule, "errno") && !js_get(rule, "errnoRet"))
+			errx(1, "seccomp errno requires numeric errnoRet");
+
+		json_object_object_del(rule, "includes");
+		json_object_object_del(rule, "excludes");
+		json_object_object_del(rule, "comment");
+		json_object_object_del(rule, "errno");
+		js_array_add(filtered, json_object_get(rule));
+	}
+
+	js_object_add(profile, "syscalls", steal_ptr(&filtered));
+}
+
+static void configure_identity(json_object *config, json_object *process,
+			       const char *hostname)
+{
+	const char *timezone = getenv("TZ");
+	json_object *old = js_need(process, "env", json_type_array);
+	autofreejson json_object *env = js_new_array();
+	for (size_t i = 0; i < json_object_array_length(old); i++) {
+		json_object *entry = json_object_array_get_idx(old, i);
+		const char *value = js_array_string(old, i);
+		if (!starts_with(value, "HOSTNAME=") &&
+		    !starts_with(value, "container_uuid=") &&
+		    (!timezone || !starts_with(value, "TZ=")))
+			js_array_add(env, json_object_get(entry));
+	}
+
+	autofree char *entry = xasprintf("HOSTNAME=%s", hostname);
+	js_array_add(env, js_new_string(entry));
+
+	if (timezone) {
+		autofree char *tz = xasprintf("TZ=%s", timezone);
+		js_array_add(env, js_new_string(tz));
+	}
+
+	js_object_add(process, "env", steal_ptr(&env));
+	js_set_string(config, "hostname", hostname);
+}
+
+static json_object *find_mount(json_object *config, const char *destination)
+{
+	json_object *mounts = js_need(config, "mounts", json_type_array);
+	for (size_t i = 0; i < json_object_array_length(mounts); i++) {
+		json_object *mount = json_object_array_get_idx(mounts, i);
+		if (!strcmp(js_string(mount, "destination"), destination))
+			return mount;
+	}
+
+	return NULL;
+}
+
+static void override_mount_source(json_object *config, const char *destination,
+				  const char *source)
+{
+	if (!source)
+		return;
+
+	json_object *mount = find_mount(config, destination);
+	if (mount)
+		js_set_string(mount, "source", source);
+}
+
+static void override_paths(json_object *config, const Options *options)
+{
+	if (options->rootfs)
+		js_set_string(js_need(config, "root", json_type_object), "path",
+			      options->rootfs);
+
+	override_mount_source(config, "/etc", options->etc_dir);
+	override_mount_source(config, "/var", options->var_dir);
+	if (options->var_dir) {
+		autofree char *tmp = join_path(options->var_dir, "tmp");
+		override_mount_source(config, "/var/tmp", tmp);
+	}
+}
+
+static void configure_mounts(json_object *config, const char *files)
+{
+	const struct {
+		const char *destination;
+		const char *filename;
+	} sources[] = {
+		{"/run/.containerenv", "containerenv"},
+		{"/run/secrets", "secrets"},
+		{"/etc/hostname", "hostname"},
+		{"/etc/resolv.conf", "resolv.conf"},
+		{"/etc/hosts", "hosts"},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(sources); i++) {
+		autofree char *source = join_path(files, sources[i].filename);
+		override_mount_source(config, sources[i].destination, source);
+	}
+
+	json_object *mounts = js_need(config, "mounts", json_type_array);
+	for (size_t i = json_object_array_length(mounts); i > 0; i--) {
+		json_object *mount = json_object_array_get_idx(mounts, i - 1);
+		if (strcmp(js_string(mount, "destination"), "/etc/localtime") ||
+		    strcmp(js_string(mount, "type"), "bind"))
+			continue;
+		const char *source = js_string(mount, "source");
+		struct stat st;
+		if (stat(source, &st) < 0) {
+			if (errno != ENOENT)
+				err(1, "stat %s", source);
+			json_object_array_del_idx(mounts, i - 1, 1);
+		}
+	}
+}
+
+/* Update an existing destination, or append it when absent. The source, type
+ * and options are replaced together so an old mount's flags cannot leak in. */
+static void set_bind_mount(json_object *config, const char *destination,
+			   const char *source, const char *const flags[],
+			   size_t n_flags)
+{
+	json_object *mount = find_mount(config, destination);
+	if (!mount) {
+		mount = js_new_object();
+		js_set_string(mount, "destination", destination);
+		js_array_add(js_need(config, "mounts", json_type_array), mount);
+	}
+
+	js_set_string(mount, "type", "bind");
+	js_set_string(mount, "source", source);
+	js_object_add(mount, "options", js_new_strings(flags, n_flags));
+}
+
+static void add_device_rule(json_object *config, dev_t device)
+{
+	json_object *resources =
+		js_need(js_need(config, "linux", json_type_object), "resources",
+			json_type_object);
+	json_object *rules = js_need(resources, "devices", json_type_array);
+
+	autofreejson json_object *rule = js_new_object();
+	js_object_add(rule, "allow", js_new_bool(true));
+	js_set_string(rule, "type", "c");
+	js_object_add(rule, "major", js_new_int(major(device)));
+	js_object_add(rule, "minor", js_new_int(minor(device)));
+	js_set_string(rule, "access", "rwm");
+	js_array_add(rules, steal_ptr(&rule));
+}
+
+static void configure_device(json_object *config, const char *source,
+			     const char *destination)
+{
+	struct stat st;
+	if (stat(source, &st) < 0) {
+		if (errno == ENOENT)
+			return;
+		err(1, "stat %s", source);
+	}
+	if (!S_ISCHR(st.st_mode))
+		errx(1, "%s is not a character device", source);
+
+	const char *const flags[] = {"bind", "rprivate", "nosuid", "noexec"};
+	set_bind_mount(config, destination, source, flags, N_ELEMENTS(flags));
+	add_device_rule(config, st.st_rdev);
+}
+
+static void configure_seccomp(json_object *linux_config, json_object *process,
+			      const char *filename)
+{
+	if (filename) {
+		autofreejson json_object *profile = js_load(filename);
+		resolve_seccomp(profile, process);
+		js_object_add(linux_config, "seccomp", steal_ptr(&profile));
+	}
+
+	if (!js_get(linux_config, "seccomp"))
+		errx(1, "base config has no seccomp filter; supply --seccomp "
+			"FILE");
+}
+
+static json_object *id_mapping(IdRange range)
+{
+	autofreejson json_object *mapping = js_new_object();
+	js_object_add(mapping, "containerID", js_new_int(0));
+	js_object_add(mapping, "hostID", js_new_int(range.start));
+	js_object_add(mapping, "size", js_new_int(range.count));
+
+	return steal_ptr(&mapping);
+}
+
+static void configure_userns(json_object *linux_config, const Options *options)
+{
+	if (options->userns == USERNS_OFF)
+		return;
+
+	IdRange uid = read_subid("/etc", "subuid", QM_SUBID_USER);
+	IdRange gid = read_subid("/etc", "subgid", QM_SUBID_USER);
+	if (!uid.found && !gid.found) {
+		if (options->userns == USERNS_REQUIRED)
+			errx(1, "%s subordinate ID ranges are required",
+			     QM_SUBID_USER);
+		return;
+	}
+	if (!uid.found || !gid.found)
+		errx(1, "%s requires both subuid and subgid ranges",
+		     QM_SUBID_USER);
+
+	if (js_get(linux_config, "uidMappings") ||
+	    js_get(linux_config, "gidMappings"))
+		errx(1, "base config already has user namespace mappings");
+
+	json_object *namespaces =
+		js_need(linux_config, "namespaces", json_type_array);
+	for (size_t i = 0; i < json_object_array_length(namespaces); i++)
+		if (!strcmp(js_string(json_object_array_get_idx(namespaces, i),
+				      "type"),
+			    "user"))
+			errx(1, "base config already has a user namespace");
+
+	autofreejson json_object *user = js_new_object();
+	js_set_string(user, "type", "user");
+	js_array_add(namespaces, steal_ptr(&user));
+
+	autofreejson json_object *uids = js_new_array();
+	js_array_add(uids, id_mapping(uid));
+	js_object_add(linux_config, "uidMappings", steal_ptr(&uids));
+
+	autofreejson json_object *gids = js_new_array();
+	js_array_add(gids, id_mapping(gid));
+	js_object_add(linux_config, "gidMappings", steal_ptr(&gids));
+}
+
+static void configure_isolation(json_object *linux_config,
+				const Options *options)
+{
+	autofree char *parent = cgroup_parent(options->prepare_only);
+	autofree char *payload = join_path(parent, PAYLOAD_CGROUP);
+	js_set_string(linux_config, "cgroupsPath", payload);
+
+	json_object *namespaces =
+		js_need(linux_config, "namespaces", json_type_array);
+	for (size_t i = 0; i < json_object_array_length(namespaces); i++) {
+		json_object *entry = json_object_array_get_idx(namespaces, i);
+		if (!strcmp(js_string(entry, "type"), "network")) {
+			autofree char *netns =
+				join_path(options->runtime_dir, "netns");
+			js_set_string(entry, "path", netns);
+			return;
+		}
+	}
+
+	errx(1, "base config requires a network namespace entry");
+}
+
+static void configure_annotations(json_object *config)
+{
+	json_object *annotations = js_get(config, "annotations");
+	autofreejson json_object *clean = js_new_object();
+	if (annotations) {
+		if (!json_object_is_type(annotations, json_type_object))
+			errx(1, "invalid annotations: expected a JSON object");
+
+		json_object_object_foreach (annotations, key, value) {
+			if (!starts_with(key, "io.podman.") &&
+			    !starts_with(key, "org.systemd.property.") &&
+			    strcmp(key, "org.opencontainers.image.stopSignal"))
+				js_object_add(clean, key,
+					      json_object_get(value));
+		}
+	}
+
+	js_set_string(clean, "io.container.manager", "qm-launch");
+	js_object_add(config, "annotations", steal_ptr(&clean));
+}
+
+static json_object *create_config(const Options *options)
+{
+	autofreejson json_object *config = js_load(options->base_config);
+	override_paths(config, options);
+
+	json_object *linux_config = js_need(config, "linux", json_type_object);
+	json_object *process = js_need(config, "process", json_type_object);
+	if (json_object_get_boolean(js_get(process, "terminal")))
+		errx(1, "terminal=true is unsupported");
+	if (js_string(js_need(config, "root", json_type_object), "path")[0] !=
+	    '/')
+		errx(1, "root.path must be absolute");
+
+	configure_seccomp(linux_config, process, options->seccomp_file);
+	configure_identity(config, process, options->hostname);
+	configure_isolation(linux_config, options);
+	configure_userns(linux_config, options);
+	configure_annotations(config);
+
+	autofree char *files = join_path(options->runtime_dir, "files");
+	configure_mounts(config, files);
+
+	configure_device(config, "/dev/kvm", "/dev/kvm");
+	configure_device(config, "/dev/fuse", "/dev/fuse");
+
+	return steal_ptr(&config);
+}
+
+static json_object *create_network_config(const Options *options)
+{
+	autofreejson json_object *network = js_new_object();
+	js_set_string(network, "container_id", QM_CONTAINER_ID);
+	js_set_string(network, "container_name", QM_CONTAINER_ID);
+	js_set_string(network, "container_hostname", options->hostname);
+	json_object *networks = js_new_object();
+	json_object *connection = js_new_object();
+
+	js_object_add(network, "networks", networks);
+	js_object_add(networks, QM_CONTAINER_ID, connection);
+	js_set_string(connection, "interface_name", "eth0");
+	const char *ips[] = {QM_IP};
+	js_object_add(connection, "static_ips",
+		      js_new_strings(ips, N_ELEMENTS(ips)));
+
+	json_object *network_info = js_new_object();
+	json_object *bridge = js_new_object();
+	js_object_add(network, "network_info", network_info);
+	js_object_add(network_info, QM_CONTAINER_ID, bridge);
+	js_set_string(bridge, "name", QM_CONTAINER_ID);
+	js_set_string(bridge, "id",
+		      "0be30723949fc04d4122a08a2debf599cb7df479bf33beeda603e10e"
+		      "c9ae3197");
+	js_set_string(bridge, "driver", "bridge");
+	js_set_string(bridge, "network_interface", "qm-br0");
+	js_object_add(bridge, "ipv6_enabled", js_new_bool(false));
+	js_object_add(bridge, "internal", js_new_bool(false));
+	js_object_add(bridge, "dns_enabled", js_new_bool(false));
+
+	json_object *subnets = js_new_array();
+	json_object *subnet = js_new_object();
+	js_object_add(bridge, "subnets", subnets);
+	js_array_add(subnets, subnet);
+	js_set_string(subnet, "subnet", "10.90.0.0/24");
+	js_set_string(subnet, "gateway", QM_GATEWAY);
+
+	json_object *ipam = js_new_object();
+	js_object_add(bridge, "ipam_options", ipam);
+	js_set_string(ipam, "driver", "host-local");
+
+	return steal_ptr(&network);
+}
+
+static void container_file(const char *base, const char *name,
+			   const char *contents, const char *context)
+{
+	autofree char *filename = join_path(base, name);
+	write_text_file(filename, contents);
+	set_selinux_label(filename, context);
+}
+
+static char *hosts_contents(const char *hosts, const char *hostname)
+{
+	bool add_container_alias = strcmp(hostname, QM_CONTAINER_ID) != 0;
+	return xasprintf("%s\n%s\thost.containers.internal "
+			 "host.docker.internal\n%s\t%s%s%s\n",
+			 hosts, QM_GATEWAY, QM_IP, hostname,
+			 add_container_alias ? " " : "",
+			 add_container_alias ? QM_CONTAINER_ID : "");
+}
+
+static void update_container_file(const Options *options, const char *name,
+				  const char *contents)
+{
+	autofree char *files = join_path(options->runtime_dir, "files");
+	autofree char *filename = join_path(files, name);
+	/* Do not create a new file after the container's runtime was removed.
+	 */
+	autoclose int fd = TEMP_FAILURE_RETRY(
+		open(filename, O_WRONLY | O_NOFOLLOW | O_CLOEXEC));
+	if (fd < 0) {
+		if (errno == ENOENT)
+			return;
+		err(1, "open %s", filename);
+	}
+
+	/* Keep the inode and its SELinux label for the container's bind mount.
+	 */
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		err(1, "stat %s", filename);
+	autofree char *padded = NULL;
+	size_t length = strlen(contents), write_length = length;
+	if (st.st_size > 0 && (uintmax_t)st.st_size > length) {
+		if ((uintmax_t)st.st_size > SIZE_MAX)
+			errx(1, "%s is too large", filename);
+		write_length = st.st_size;
+		padded = xmalloc(write_length);
+		memcpy(padded, contents, length);
+		/* Overwrite the old tail with whitespace in the same write. */
+		memset(padded + length, ' ', write_length - length);
+	}
+	write_all(fd, padded ? padded : contents, write_length);
+	if (ftruncate(fd, length) < 0)
+		err(1, "truncate %s", filename);
+}
+
+static int update_resolv_conf(const Options *options)
+{
+	autofree char *dns = try_read_text_file(options->resolv_conf);
+	if (!dns && errno != ENOENT)
+		err(1, "read %s", options->resolv_conf);
+	if (dns)
+		update_container_file(options, "resolv.conf", dns);
+
+	autofree char *hosts = try_read_text_file("/etc/hosts");
+	if (!hosts) {
+		if (errno == ENOENT)
+			return 0;
+		err(1, "read /etc/hosts");
+	}
+
+	/* Use the hostname saved at startup, including any --hostname override.
+	 */
+	autofree char *hostname_file =
+		join_path(options->runtime_dir, "files/hostname");
+	autofree char *hostname = try_read_text_file(hostname_file);
+	if (!hostname) {
+		if (errno == ENOENT)
+			return 0;
+		err(1, "read %s", hostname_file);
+	}
+	hostname[strcspn(hostname, "\r\n")] = '\0';
+	autofree char *contents = hosts_contents(hosts, hostname);
+	update_container_file(options, "hosts", contents);
+	return 0;
+}
+
+static void write_container_files(const Options *options, json_object *config)
+{
+	const char *context =
+		options->prepare_only
+			? NULL
+			: json_object_get_string(js_get(js_get(config, "linux"),
+							"mountLabel"));
+
+	autofree char *files = join_path(options->runtime_dir, "files");
+	ensure_private_directory(files);
+	set_selinux_label(files, context);
+
+	autofree char *secrets = join_path(files, "secrets");
+	ensure_private_directory(secrets);
+	set_selinux_label(secrets, context);
+
+	container_file(files, "containerenv", "", context);
+
+	autofree char *hostname = xasprintf("%s\n", options->hostname);
+	container_file(files, "hostname", hostname, context);
+
+	autofree char *dns = try_read_text_file(options->resolv_conf);
+	if (!dns && errno != ENOENT)
+		err(1, "read %s", options->resolv_conf);
+	container_file(files, "resolv.conf", dns ? dns : "", context);
+
+	autofree char *hosts = read_text_file("/etc/hosts");
+	autofree char *contents = hosts_contents(hosts, options->hostname);
+	container_file(files, "hosts", contents, context);
+}
+
+static void write_bundle(const Options *options, json_object *config,
+			 json_object *network)
+{
+	ensure_private_directory(options->runtime_dir);
+	write_container_files(options, config);
+	autofree char *netavark_state =
+		join_path(options->runtime_dir, "netavark");
+	ensure_private_directory(netavark_state);
+	autofree char *crun_state = join_path(options->runtime_dir, "crun");
+	ensure_private_directory(crun_state);
+
+	autofree char *oci_config =
+		join_path(options->runtime_dir, "config.json");
+	js_save(config, oci_config);
+	autofree char *network_config =
+		join_path(options->runtime_dir, "network.json");
+	js_save(network, network_config);
+}
+
+static void usage(FILE *output)
+{
+	fprintf(output,
+		"Usage: qm-launch [OPTIONS] BASE_CONFIG\n"
+		"       qm-launch --cleanup [--runtime-dir DIR]\n"
+		"       qm-launch --update-resolv-conf [--runtime-dir DIR] "
+		"[--resolv-conf FILE]\n"
+		"       qm-launch [OPTIONS] --exec [--] COMMAND [ARG...]\n\n"
+		"  --hostname NAME       Container hostname (default %s)\n"
+		"  --rootfs DIR          Override root.path\n"
+		"  --etc-dir DIR         Override the /etc bind source\n"
+		"  --var-dir DIR         Override the /var and /var/tmp bind "
+		"sources\n"
+		"  --seccomp FILE        OCI or containers-style seccomp JSON\n"
+		"  --runtime-dir DIR     Runtime files (default %s)\n"
+		"                        RUNTIME_DIRECTORY overrides the "
+		"default\n"
+		"  --resolv-conf FILE    DNS configuration (default host "
+		"resolv.conf)\n"
+		"  --userns MODE         auto (default), off, or required; "
+		"auto uses "
+		"%s subids when present\n"
+		"  --prepare-only        Write bundle without privileged "
+		"setup\n"
+		"  --cleanup             Delete container and tear down "
+		"networking\n"
+		"  --update-resolv-conf  Update the running container's DNS "
+		"and hosts files in place\n"
+		"  --exec COMMAND ...    Run a command in the running "
+		"container; "
+		"must be last option\n",
+		DEFAULT_HOSTNAME, DEFAULT_RUNTIME_DIR, QM_SUBID_USER);
+}
+
+static UserNamespaceMode parse_userns_mode(const char *mode)
+{
+	if (!strcmp(mode, "auto"))
+		return USERNS_AUTO;
+	if (!strcmp(mode, "off"))
+		return USERNS_OFF;
+	if (!strcmp(mode, "required"))
+		return USERNS_REQUIRED;
+	errx(1, "invalid userns mode: %s", mode);
+}
+
+static void require_absolute_path(const char *option, const char *path)
+{
+	if (path && path[0] != '/')
+		errx(1, "%s must be an absolute path: %s", option, path);
+}
+
+static Options parse_options(int argc, char **argv)
+{
+	const char *runtime_dir = getenv("RUNTIME_DIRECTORY");
+	Options options = {
+		.hostname = DEFAULT_HOSTNAME,
+		.resolv_conf =
+			access("/run/systemd/resolve/resolv.conf", R_OK) == 0
+				? "/run/systemd/resolve/resolv.conf"
+				: "/etc/resolv.conf",
+		.runtime_dir = runtime_dir && *runtime_dir
+				       ? runtime_dir
+				       : DEFAULT_RUNTIME_DIR,
+		.userns = USERNS_AUTO,
+	};
+
+	static const struct option long_options[] = {
+		{"hostname", required_argument, NULL, 'H'},
+		{"rootfs", required_argument, NULL, 'f'},
+		{"etc-dir", required_argument, NULL, 'e'},
+		{"var-dir", required_argument, NULL, 'v'},
+		{"seccomp", required_argument, NULL, 's'},
+		{"runtime-dir", required_argument, NULL, 'r'},
+		{"resolv-conf", required_argument, NULL, 'R'},
+		{"userns", required_argument, NULL, 'u'},
+		{"prepare-only", no_argument, NULL, 'p'},
+		{"cleanup", no_argument, NULL, 'C'},
+		{"update-resolv-conf", no_argument, NULL, 'U'},
+		{"exec", no_argument, NULL, 'X'},
+		{"help", no_argument, NULL, 'h'},
+		{NULL, 0, NULL, 0}};
+
+	int option;
+	while ((option = getopt_long(argc, argv, "", long_options, NULL)) !=
+	       -1) {
+		switch (option) {
+		case 'H':
+			options.hostname = optarg;
+			break;
+		case 'f':
+			options.rootfs = optarg;
+			break;
+		case 'e':
+			options.etc_dir = optarg;
+			break;
+		case 'v':
+			options.var_dir = optarg;
+			break;
+		case 's':
+			options.seccomp_file = optarg;
+			break;
+		case 'r':
+			options.runtime_dir = optarg;
+			break;
+		case 'R':
+			options.resolv_conf = optarg;
+			break;
+		case 'u':
+			options.userns = parse_userns_mode(optarg);
+			break;
+		case 'p':
+			options.prepare_only = true;
+			break;
+		case 'C':
+			options.cleanup_only = true;
+			break;
+		case 'U':
+			options.update_resolv_conf = true;
+			break;
+		case 'X':
+			if (optind < argc && !strcmp(argv[optind], "--"))
+				optind++;
+			options.exec_argv = argv + optind;
+			goto parsed;
+		case 'h':
+			usage(stdout);
+			exit(0);
+		default:
+			usage(stderr);
+			exit(2);
+		}
+	}
+
+parsed:
+	require_absolute_path("--runtime-dir", options.runtime_dir);
+	require_absolute_path("--rootfs", options.rootfs);
+	require_absolute_path("--etc-dir", options.etc_dir);
+	require_absolute_path("--var-dir", options.var_dir);
+
+	if (options.exec_argv) {
+		if (options.cleanup_only || options.prepare_only ||
+		    options.update_resolv_conf)
+			errx(1, "--exec cannot be combined with --cleanup or "
+				"--prepare-only or --update-resolv-conf");
+		if (!options.exec_argv[0] || !*options.exec_argv[0])
+			errx(1, "--exec requires a command");
+		return options;
+	}
+
+	if (options.update_resolv_conf) {
+		if (options.cleanup_only || options.prepare_only)
+			errx(1, "--update-resolv-conf cannot be combined with "
+				"--cleanup or --prepare-only");
+		if (optind != argc)
+			errx(1, "--update-resolv-conf takes no base config");
+		return options;
+	}
+
+	if (options.cleanup_only) {
+		if (options.prepare_only || optind != argc)
+			errx(1, "--cleanup takes no base config");
+		return options;
+	}
+
+	if (optind + 1 != argc) {
+		usage(stderr);
+		exit(2);
+	}
+
+	options.base_config = argv[optind];
+
+	const char *hostname_chars = "abcdefghijklmnopqrstuvwxyz"
+				     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				     "0123456789.-";
+	if (!*options.hostname || strlen(options.hostname) > 64 ||
+	    strspn(options.hostname, hostname_chars) !=
+		    strlen(options.hostname))
+		errx(1, "invalid hostname");
+
+	return options;
+}
+
+int main(int argc, char **argv)
+{
+	const Options options = parse_options(argc, argv);
+
+	if (options.exec_argv)
+		return exec_in_container(&options);
+
+	if (options.cleanup_only)
+		return cleanup(&options);
+	if (options.update_resolv_conf)
+		return update_resolv_conf(&options);
+
+	autofree char *netns = join_path(options.runtime_dir, "netns");
+	if (ns_is_mounted(netns))
+		errx(1, "runtime namespace already exists; stop the service or "
+			"run --cleanup");
+
+	autofreejson json_object *config = create_config(&options);
+	autofreejson json_object *network = create_network_config(&options);
+	write_bundle(&options, config, network);
+	if (options.prepare_only)
+		return 0;
+
+	if (geteuid() != 0)
+		errx(1, "launch requires root");
+
+	bool netns_file_created = false;
+	int status = setup_network(&options, &netns_file_created);
+	if (!status)
+		status = crun_run(&options);
+
+	if (netns_file_created)
+		cleanup(&options);
+
+	return status;
+}

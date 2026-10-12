@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Copyright (C) 2026 Alexander Larsson
+# See COPYING for the full license text.
+
+[Unit]
+Description=Update QM DNS and hosts configuration
+Requisite=qm2.service
+PartOf=qm2.service
+After=qm2.service
+
+[Service]
+Type=oneshot
+# Reuse the directory without removing qm2.service's runtime files on exit.
+RuntimeDirectory=qm
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=@BINDIR@/qm-launch --update-resolv-conf
