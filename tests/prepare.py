@@ -300,6 +300,7 @@ class PrepareTests(unittest.TestCase):
     def test_update_resolver_missing_files(self):
         result = self.update_resolv()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
         self.assertFalse(self.runtime.exists())
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -308,6 +309,17 @@ class PrepareTests(unittest.TestCase):
         result = self.update_resolv()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.runtime / "files/resolv.conf").read_text(), contents)
+
+    def test_update_resolver_missing_destination(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.runtime / "files/resolv.conf"
+        target.unlink()
+        self.resolv.write_text("nameserver 192.0.2.55\n")
+        result = self.update_resolv()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertFalse(target.exists())
 
     def test_update_resolver_read_error(self):
         result = self.prepare()

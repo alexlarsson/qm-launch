@@ -8,6 +8,7 @@ Description=Update QM DNS and hosts configuration
 DefaultDependencies=no
 Requisite=qmc.service
 PartOf=qmc.service
+# Queue changes seen during startup until QM's bind-mounted files are ready.
 After=qmc.service
 Conflicts=shutdown.target
 Before=shutdown.target

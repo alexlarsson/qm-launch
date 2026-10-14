@@ -190,9 +190,10 @@ available, otherwise `/etc/resolv.conf`. A missing resolver file produces an
 empty container resolver file. Nameservers must be reachable from
 the container, so a host loopback resolver is unsuitable.
 
-`qmc.service` starts `qmc-resolv-conf.path`, which watches `/etc/resolv.conf`,
-`/etc/hosts` and systemd-resolved's upstream file. Changes trigger
-`qmc-resolv-conf.service` to run `qmc update-resolv-conf`. It updates
+`qmc.service` starts `qmc-resolv-conf.path` before launching QM. It watches
+`/etc/resolv.conf`, `/etc/hosts` and systemd-resolved's upstream file. Changes
+trigger `qmc-resolv-conf.service` to run `qmc update-resolv-conf`; changes during
+startup wait until QM is ready. It updates
 `/run/qm/files/resolv.conf` and `/run/qm/files/hosts` in place so the container's
 bind mounts see the new contents. Shorter contents are padded with spaces before
 truncation. The hosts file retains the generated gateway and container hostname

@@ -4,11 +4,11 @@
 
 [Unit]
 Description=Watch QM host DNS and hosts configuration
-# Watch after QM is ready without making paths.target wait for container boot.
+# Install watches before QM reads the host files during startup.
 DefaultDependencies=no
 BindsTo=qmc.service
 PartOf=qmc.service
-After=qmc.service
+Before=qmc.service
 Conflicts=shutdown.target
 Before=shutdown.target
 
