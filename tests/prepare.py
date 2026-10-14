@@ -99,6 +99,29 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.generated()["linux"]["seccomp"], profile)
 
+    def test_console_and_verbose_logging(self):
+        result = self.prepare(extra=("--verbose",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        process = self.generated()["process"]
+        self.assertTrue(process["terminal"])
+        self.assertFalse(any(e.startswith("SYSTEMD_LOG_") for e in process["env"]))
+        self.base["process"]["env"] += ["SYSTEMD_LOG_LEVEL=warning",
+                                        "SYSTEMD_LOG_TARGET=journal"]
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        process = self.generated()["process"]
+        self.assertTrue(process["terminal"])
+        self.assertIn("SYSTEMD_LOG_LEVEL=warning", process["env"])
+        self.assertIn("SYSTEMD_LOG_TARGET=journal", process["env"])
+        result = self.prepare(extra=("--verbose",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = self.generated()["process"]["env"]
+        self.assertEqual([e for e in env if e.startswith("SYSTEMD_LOG_LEVEL=")],
+                         ["SYSTEMD_LOG_LEVEL=warning"])
+        self.assertEqual([e for e in env if e.startswith("SYSTEMD_LOG_TARGET=")],
+                         ["SYSTEMD_LOG_TARGET=journal"])
+        self.assertIn("HOME=/root", env)
+
     def test_seccomp_required(self):
         result = self.prepare(seccomp=False)
         self.assertGreater(result.returncode, 0)

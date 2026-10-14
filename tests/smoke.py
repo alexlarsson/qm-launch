@@ -9,6 +9,8 @@ import re
 import select
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,7 @@ def run(*args):
 
 INIT = r'''
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,12 +36,34 @@ INIT = r'''
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static void stop(int signum) { (void)signum; _exit(0); }
+static int notify_fd = -1;
+static void ready(int signum) {
+    (void)signum;
+    if (notify_fd >= 0 && write(notify_fd, "READY=1", 7) != 7)
+        _exit(14);
+}
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--console-fail")) {
+        /* Like systemd PID 1, discard inherited stdio and reopen the console. */
+        for (int fd = 0; fd < 3; fd++)
+            close(fd);
+        usleep(100000);
+        int console = open("/dev/console", O_WRONLY | O_NOCTTY);
+        if (console < 0 || !isatty(console))
+            return 15;
+        for (int i = 0; i < 2048; i++)
+            if (dprintf(console, "Fatal init diagnostic %d\n", i) < 0)
+                return 16;
+        return 255;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--notify"))
+        return kill(1, SIGUSR1) < 0 ? 13 : 0;
     if (argc == 2 && !strcmp(argv[1], "--network-check")) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         struct timeval timeout = { .tv_sec = 4 };
@@ -98,7 +123,25 @@ int main(int argc, char **argv)
     if (!file)
         return 6;
     fclose(file);
+    const char *notify = getenv("NOTIFY_SOCKET");
+    if (notify) {
+        /* PID 1 must be able to bind its own service notification socket. */
+        mkdir("/run/systemd", 0755);
+        struct sockaddr_un own = { .sun_family = AF_UNIX,
+                                   .sun_path = "/run/systemd/notify" };
+        int own_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (own_fd < 0 || bind(own_fd, (struct sockaddr *)&own, sizeof(own)))
+            return 17;
+        struct sockaddr_un address = { .sun_family = AF_UNIX };
+        if (strlen(notify) >= sizeof(address.sun_path))
+            return 12;
+        strcpy(address.sun_path, notify);
+        notify_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (notify_fd < 0 || connect(notify_fd, (struct sockaddr *)&address, sizeof(address)))
+            return 12;
+    }
     signal(SIGRTMIN + 3, stop);
+    signal(SIGUSR1, ready);
     puts("READY");
     fflush(stdout);
     for (;;) pause();
@@ -185,19 +228,22 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     pathlib.Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
     pathlib.Path("/proc/sys/net/ipv4/conf/default/forwarding").write_text("0\n")
 
-    def launch(attempt, extra=(), existing_netns=False):
+    def launch(attempt, extra=(), existing_netns=False, notify_socket=None):
         runtime = directory / f"runtime-{attempt}"
         if existing_netns:
             runtime.mkdir(mode=0o700)
             (runtime / "netns").touch()
 
+        environment = {**os.environ, "RUNTIME_DIRECTORY": str(runtime)}
+        if notify_socket is not None:
+            environment["NOTIFY_SOCKET"] = str(notify_socket)
         process = subprocess.Popen(
             [str(LAUNCHER),
              "--seccomp", str(SOURCE / "tests/seccomp-no-rt.json"),
              "--resolv-conf", str(resolv), "--userns", "off",
              *extra, str(base)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env={**os.environ, "RUNTIME_DIRECTORY": str(runtime)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=environment,
         )
         return process, runtime
 
@@ -237,7 +283,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             chunk = os.read(process.stdout.fileno(), 4096)
             print(chunk.decode(), end="", flush=True)
             output += chunk
-            if b"READY\n" in output:
+            if b"READY\n" in output.replace(b"\r\n", b"\n"):
                 ready = True
                 break
             if not chunk:
@@ -312,7 +358,92 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             process.wait()
         run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
 
+    # Crun must wait for payload readiness and forward it as the main process.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
+        notify.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+        pathlib.Path("/run/systemd").mkdir(exist_ok=True)
+        notify.bind("/run/systemd/notify")
+        process, runtime = launch("notify", notify_socket="/run/systemd/notify")
+        try:
+            assert select.select([process.stdout], [], [], 10)[0]
+            assert process.stdout.readline() == "READY\n"
+            assert (runtime / "notify.sock").readlink() == pathlib.Path("/run/systemd/notify")
+            assert not select.select([notify], [], [], 0.1)[0], "premature readiness"
+            run(str(LAUNCHER), "--runtime-dir", str(runtime), "--exec", "/init", "--notify")
+            notify.settimeout(5)
+            message, ancillary, flags, address = notify.recvmsg(
+                256, socket.CMSG_SPACE(struct.calcsize("3i")))
+            assert message == b"READY=1", message
+            credentials = next(data for level, kind, data in ancillary
+                               if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS)
+            assert struct.unpack("3i", credentials)[0] == process.pid
+            # Closing the receiver also releases any queued notification barrier FD.
+            notify.close()
+            os.kill(process.pid, signal.SIGRTMIN + 3)
+            stdout, stderr = process.communicate(timeout=10)
+            assert process.returncode == 0, stderr
+            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+            assert_network_removed(runtime)
+            print("Crun proxies payload readiness as the main process for NotifyAccess=main", flush=True)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+            pathlib.Path("/run/systemd/notify").unlink()
+
     crun = "/usr/bin/crun"
+
+    # Capture a fatal init error after it has closed all inherited stdio.
+    config["process"]["args"] = ["/init", "--console-fail"]
+    base.write_text(json.dumps(config))
+    process, runtime = launch("console-failure", extra=("--verbose",))
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 255, (stdout, stderr)
+        assert stdout == "".join(f"Fatal init diagnostic {i}\n" for i in range(2048)), stdout
+        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        assert_network_removed(runtime)
+        print("Console diagnostics reach stdout, drain on exit and preserve exit 255", flush=True)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+
+    # A runtime failure before sending the console must not orphan the relay.
+    config["process"]["args"] = ["/missing-init"]
+    base.write_text(json.dumps(config))
+    process, runtime = launch("missing-init")
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode != 0, (stdout, stderr)
+    assert "missing-init" in stderr, stderr
+    run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+    assert_network_removed(runtime)
+    print("Crun startup failure stops the waiting console relay", flush=True)
+
+    config["process"]["args"] = ["/init"]
+    config["process"]["terminal"] = False
+    base.write_text(json.dumps(config))
+    process, runtime = launch("no-console")
+    try:
+        assert select.select([process.stdout], [], [], 10)[0]
+        assert process.stdout.readline() == "READY\n"
+        assert not (runtime / "console.sock").exists()
+        os.kill(process.pid, signal.SIGRTMIN + 3)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        assert_network_removed(runtime)
+        print("Custom configurations without a terminal retain ordinary stdio", flush=True)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+    config["process"]["terminal"] = True
+    base.write_text(json.dumps(config))
+
     missing_crun = directory / "missing-crun"
     missing_crun.write_text("#!/missing-interpreter\n")
     missing_crun.chmod(0o755)
@@ -383,10 +514,12 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     (runtime / "state.json").write_text(json.dumps({
         "version": 1, "bundle": str(runtime),
         "crun": {"executable": "/bin/false", "root": str(old_crun), "id": "qm"}}))
-    process, runtime = launch("cleanup-warning")
+    (runtime / "notify.sock").symlink_to("/run/old-notify.sock")
+    process, runtime = launch("cleanup-warning", notify_socket="/run/new-notify.sock")
     try:
         assert select.select([process.stdout], [], [], 10)[0]
         assert process.stdout.readline() == "READY\n"
+        assert (runtime / "notify.sock").readlink() == pathlib.Path("/run/new-notify.sock")
         os.kill(process.pid, signal.SIGRTMIN + 3)
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
@@ -532,3 +665,5 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     assert f"create {runtime / 'netns'}" in stderr, stderr
     assert (runtime / "netns").exists(), "must preserve a namespace file we did not create"
     print("Namespace creation failure preserves the existing file", flush=True)
+
+subprocess.run([sys.executable, str(SOURCE / "tests/systemd.py"), str(LAUNCHER)], check=True)

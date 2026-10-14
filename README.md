@@ -31,6 +31,20 @@ For example, this may be the ExecStart option:
 qm-launch --hostname qm --seccomp seccomp-no-rt.json qm.json
 ```
 
+Pass `--verbose` to log configuration, cleanup, bundle and network setup phases
+to stderr and enable crun's `--debug` output. `qm2.service` enables this by
+default. Read the output with
+`journalctl -b -u qm2.service --no-pager`. For command debugging, put
+`--verbose` before `--exec`.
+
+The supplied OCI configuration enables a pseudo-terminal for QM's
+`/dev/console`. Crun hands its master descriptor to a launcher child, which
+copies console output to the launcher's stdout, captured by the service journal.
+This includes systemd's early startup output, using its normal logging settings.
+The relay provides output only; use `--exec` for an interactive shell.
+It drains the console when the container exits and stops if crun dies.
+Custom configurations with `process.terminal=false` retain ordinary stdio.
+
 Run a command in the running container with `--exec`. For an interactive shell
 in the container started by `qm2.service`:
 
@@ -84,7 +98,9 @@ interface or table names. Cleanup checks the recorded interface and table
 ownership. The fixed network supports one QM instance per host.
 Host IPv4 forwarding remains enabled after cleanup. The installed
 `90-qm-launch.conf` sysctl drop-in preserves interface settings when udev
-runs systemd-sysctl; setup creates no files in `/run/sysctl.d`.
+runs systemd-sysctl. Missing interfaces are ignored during the early-boot pass;
+udev applies the settings when the interfaces appear. Setup creates no files
+in `/run/sysctl.d`.
 
 IPv6 and DNS proxying are disabled. `--resolv-conf`
 selects a file to copy; the default uses systemd-resolved's upstream file when
@@ -128,8 +144,16 @@ Without saved state, cleanup leaves unrecorded resources alone. `--prepare-only`
 does not record ownership or perform cleanup, and refuses pending cleanup state.
 Use one launcher per runtime directory.
 Avoid systemd filesystem/network namespace sandbox options: cleanup must see
-the namespace mount created during startup. The service reports process
-startup, without a container readiness notification protocol.
+the namespace mount created during startup. The service uses `Type=notify`:
+crun inherits systemd's `NOTIFY_SOCKET`, exposes a proxy socket inside QM, and
+forwards `READY=1` from the container's systemd. The launcher gives crun a
+symlink at `/run/qm/notify.sock` pointing to the host socket, placing the
+container proxy at `/run/qm/notify.sock/notify`. This leaves
+`/run/systemd/notify` available for QM's own services. The alias follows
+`--runtime-dir`; the host notify socket must use an absolute filesystem path.
+Startup completes when QM
+finishes booting. If readiness never arrives, the service's startup timeout
+applies. This requires crun built with systemd support.
 
 Inspect the generated bundle without privileged setup:
 
@@ -145,7 +169,10 @@ The optional live smoke test runs with temporary user, mount and network
 namespaces, plus a delegated transient user service. It exercises cgroup
 delegation, native networking, MTU selection, NAT traffic, foreground crun,
 graceful shutdown, failure rollback and crash recovery. It uses
-a small test init, rather than the QM rootfs or its SELinux policy. It uses
+a small test init and a separate systemd boot test using the host's `/usr`,
+without the QM rootfs or its SELinux policy. The systemd test checks both
+notifications from services inside the container and readiness forwarded to
+the host. It uses
 `tests/seccomp-no-rt.json` and disables host subid detection for the live launch.
 Device and subid preparation tests use private `/dev` and `/etc` mounts:
 

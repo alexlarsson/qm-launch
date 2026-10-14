@@ -5,6 +5,7 @@
 
 #define _GNU_SOURCE
 #include "config.h"
+#include "qm-console.h"
 #include "qm-network.h"
 #include "qm-state.h"
 #include "qm-utils.h"
@@ -14,6 +15,8 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <json-c/json.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +38,7 @@
 #define DEFAULT_HOSTNAME "qm"
 #define DEFAULT_RUNTIME_DIR "/run/qm"
 #define CRUN "/usr/bin/crun"
+#define CRUN_PREFIX_ARGS 4
 
 typedef enum { USERNS_AUTO, USERNS_OFF, USERNS_REQUIRED } UserNamespaceMode;
 
@@ -51,11 +55,42 @@ typedef struct {
 	const char *runtime_dir;
 	UserNamespaceMode userns;
 
+	bool verbose;
 	bool prepare_only;
 	bool cleanup_only;
 	bool update_resolv_conf;
 	char **exec_argv; /* Borrowed from main's argv, NULL-terminated. */
 } Options;
+
+static void log_verbose(bool enabled, const char *format, ...)
+	__attribute__((format(printf, 2, 3)));
+
+static void log_verbose(bool enabled, const char *format, ...)
+{
+	if (!enabled)
+		return;
+	int saved_errno = errno;
+	va_list args;
+	va_start(args, format);
+	fputs("qm-launch: ", stderr);
+	vfprintf(stderr, format, args);
+	fputc('\n', stderr);
+	va_end(args);
+	errno = saved_errno;
+}
+
+/* Global crun options must precede the subcommand. */
+static size_t crun_prefix(char **argv, const char *executable, const char *root,
+			  bool verbose)
+{
+	size_t index = 0;
+	argv[index++] = (char *)executable;
+	if (verbose)
+		argv[index++] = "--debug";
+	argv[index++] = "--root";
+	argv[index++] = (char *)root;
+	return index;
+}
 
 static NetworkOptions get_network_options(const Options *options)
 {
@@ -85,7 +120,7 @@ static void save_state(const State *state, const char *runtime_dir, bool replace
 
 static void write_bundle(const Options *options, json_object *config);
 
-static int crun_delete(const State *state)
+static int crun_delete(const State *state, bool verbose)
 {
 	if (!state->crun_executable)
 		return 0;
@@ -101,8 +136,14 @@ static int crun_delete(const State *state)
 		return 1;
 	}
 
-	char *argv[] = {(char *)executable, "--root", (char *)root,
-			"delete", "--force", (char *)id, NULL};
+	log_verbose(verbose, "Deleting container %s with %s (state root %s)",
+		    id, executable, root);
+	char *argv[CRUN_PREFIX_ARGS + 4];
+	size_t index = crun_prefix(argv, executable, root, verbose);
+	argv[index++] = "delete";
+	argv[index++] = "--force";
+	argv[index++] = (char *)id;
+	argv[index] = NULL;
 
 	return run_command(argv);
 }
@@ -142,33 +183,45 @@ static int remove_runtime_path(const char *path, bool directory)
 	return 1;
 }
 
-static int cleanup(const char *runtime_dir)
+static int cleanup(const char *runtime_dir, bool verbose)
 {
 	autofree char *state_file = join_path(runtime_dir, QM_STATE_FILE);
 	if (access(state_file, F_OK) < 0) {
-		if (errno == ENOENT)
+		if (errno == ENOENT) {
+			log_verbose(verbose, "No saved cleanup state at %s",
+				    state_file);
 			return remove_runtime_path(runtime_dir, true);
+		}
 		warn("access %s", state_file);
 		return 1;
 	}
+	log_verbose(verbose, "Loading cleanup state from %s", state_file);
 	autofreejson json_object *object = js_load(state_file);
 	autostate State *state = state_deserialize(object);
-	int result = crun_delete(state);
+	int result = crun_delete(state, verbose);
+	log_verbose(verbose, "Tearing down recorded network resources");
 	result |= network_teardown(state->network);
+	log_verbose(verbose, "Removing recorded network namespace %s",
+		    state->netns ? state->netns : "(none)");
 	result |= teardown_namespace(state->netns);
-	if (!result && state->bundle)
+	if (!result && state->bundle) {
+		log_verbose(verbose, "Removing runtime bundle %s", state->bundle);
 		result |= remove_tree(state->bundle);
+	}
 	if (!result) {
 		result |= remove_runtime_path(state_file, false);
 		if (!result)
 			result |= remove_runtime_path(runtime_dir, true);
 	}
 
+	log_verbose(verbose, "Cleanup %s", result ? "incomplete" : "complete");
 	return result != 0;
 }
 
 static int setup(const Options *options, json_object *config, bool *state_created)
 {
+	log_verbose(options->verbose, "Preparing runtime directory %s",
+		    options->runtime_dir);
 	ensure_private_directory(options->runtime_dir);
 	autofree char *netns = join_path(options->runtime_dir, "netns");
 	/* Do not claim a pre-existing pin, even when it is only an empty file. */
@@ -192,14 +245,18 @@ static int setup(const Options *options, json_object *config, bool *state_create
 	};
 	/* Check for conflicts before replacing an earlier cleanup journal. */
 	const NetworkOptions network = get_network_options(options);
+	log_verbose(options->verbose, "Checking network resource ownership");
 	state->network = network_prepare(&network);
 	if (!state->network) {
 		warnx("QM network preparation failed");
 		return 1;
 	}
+	log_verbose(options->verbose, "Saving cleanup state in %s/%s",
+		    options->runtime_dir, QM_STATE_FILE);
 	save_state(state, options->runtime_dir, true);
 	*state_created = true;
 	write_bundle(options, config);
+	log_verbose(options->verbose, "Creating network namespace %s", netns);
 	bool netns_file_created;
 	if (create_net_ns(netns, &netns_file_created)) {
 		if (!netns_file_created) {
@@ -210,29 +267,86 @@ static int setup(const Options *options, json_object *config, bool *state_create
 		return 1;
 	}
 
+	log_verbose(options->verbose,
+		    "Setting up network: bridge=%s veth=%s address=%s/%u "
+		    "gateway=%s nftables=%s",
+		    network.bridge, network.veth, network.ip, network.prefix_len,
+		    network.gateway, network.nft_table);
 	if (network_setup(&network, state->network)) {
 		warnx("QM network setup failed");
 		return 1;
 	}
 
+	log_verbose(options->verbose, "Network setup complete");
 	return 0;
 }
 
-static int crun_run(const Options *options)
+static int crun_run(const Options *options, json_object *config)
 {
 	autofree char *crun_state = join_path(options->runtime_dir, "crun");
-	char *argv[] = {CRUN,
-			"--root",
-			crun_state,
-			"--cgroup-manager=cgroupfs",
-			"run",
-			"--bundle",
-			(char *)options->runtime_dir,
-			(char *)QM_CONTAINER_ID,
-			NULL};
+	autofree char *notify_alias = NULL;
+	const char *notify_socket = getenv("NOTIFY_SOCKET");
+	if (notify_socket && *notify_socket) {
+		/* Crun mounts its proxy at NOTIFY_SOCKET inside the container and
+		 * appends /notify. Systemd needs /run/systemd/notify for its own
+		 * services, so give crun an alias outside that directory. On the
+		 * host the alias still resolves to our service manager's socket.
+		 */
+		if (notify_socket[0] != '/') {
+			warnx("NOTIFY_SOCKET must be an absolute filesystem path");
+			return 1;
+		}
+		notify_alias = join_path(options->runtime_dir, "notify.sock");
+		log_verbose(options->verbose, "Aliasing host notify socket %s at %s",
+			    notify_socket, notify_alias);
+		/* Startup may be continuing after incomplete cleanup. */
+		if (unlink(notify_alias) < 0 && errno != ENOENT) {
+			warn("remove old notify alias %s", notify_alias);
+			return 1;
+		}
+		if (symlink(notify_socket, notify_alias) < 0) {
+			warn("create notify alias %s", notify_alias);
+			return 1;
+		}
+		if (setenv("NOTIFY_SOCKET", notify_alias, 1) < 0) {
+			warn("set NOTIFY_SOCKET");
+			return 1;
+		}
+	}
+	autofree char *console_socket = NULL;
+	pid_t console_pid = -1;
+	if (json_object_get_boolean(js_get(js_get(config, "process"), "terminal"))) {
+		console_socket = join_path(options->runtime_dir, "console.sock");
+		log_verbose(options->verbose, "Forwarding container console to stdout");
+		console_pid = console_start(console_socket);
+		if (console_pid < 0)
+			return 1;
+	}
+	char *argv[CRUN_PREFIX_ARGS + 8];
+	size_t index = crun_prefix(argv, CRUN, crun_state, options->verbose);
+	argv[index++] = "--cgroup-manager=cgroupfs";
+	argv[index++] = "run";
+	argv[index++] = "--bundle";
+	argv[index++] = (char *)options->runtime_dir;
+	if (console_socket) {
+		argv[index++] = "--console-socket";
+		argv[index++] = console_socket;
+	}
+	argv[index++] = QM_CONTAINER_ID;
+	argv[index] = NULL;
+	notify_socket = getenv("NOTIFY_SOCKET");
+	log_verbose(options->verbose,
+		    "Starting container %s with %s (bundle %s, state root %s, "
+		    "NOTIFY_SOCKET=%s)",
+		    QM_CONTAINER_ID, CRUN, options->runtime_dir, crun_state,
+		    notify_socket ? notify_socket : "(unset)");
 
 	execv(CRUN, argv);
 	warn("exec %s", CRUN);
+	if (console_pid > 0) {
+		kill(console_pid, SIGTERM);
+		wait_child(console_pid);
+	}
 
 	return 1;
 }
@@ -240,22 +354,23 @@ static int crun_run(const Options *options)
 static int exec_in_container(const Options *options)
 {
 	autofree char *crun_state = join_path(options->runtime_dir, "crun");
-	char *prefix[] = {CRUN, "--root", crun_state,
-			  "--cgroup-manager=cgroupfs", "exec"};
 	size_t command_count = 0;
 	while (options->exec_argv[command_count])
 		command_count++;
 
-	autofree char **argv = xmalloc(
-		(N_ELEMENTS(prefix) + command_count + 3) * sizeof(*argv));
-	memcpy(argv, prefix, sizeof(prefix));
-	size_t index = N_ELEMENTS(prefix);
+	autofree char **argv =
+		xmalloc((CRUN_PREFIX_ARGS + command_count + 5) * sizeof(*argv));
+	size_t index = crun_prefix(argv, CRUN, crun_state, options->verbose);
+	argv[index++] = "--cgroup-manager=cgroupfs";
+	argv[index++] = "exec";
 	if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
 		argv[index++] = "--tty";
 	argv[index++] = (char *)QM_CONTAINER_ID;
 	memcpy(argv + index, options->exec_argv,
 	       (command_count + 1) * sizeof(*argv));
 
+	log_verbose(options->verbose, "Executing %s in container %s with %s",
+		    options->exec_argv[0], QM_CONTAINER_ID, CRUN);
 	execv(CRUN, argv);
 	warn("exec %s", CRUN);
 
@@ -577,8 +692,10 @@ static json_object *id_mapping(IdRange range)
 
 static void configure_userns(json_object *linux_config, const Options *options)
 {
-	if (options->userns == USERNS_OFF)
+	if (options->userns == USERNS_OFF) {
+		log_verbose(options->verbose, "User namespace detection disabled");
 		return;
+	}
 
 	IdRange uid = read_subid("/etc", "subuid", QM_SUBID_USER);
 	IdRange gid = read_subid("/etc", "subgid", QM_SUBID_USER);
@@ -586,11 +703,17 @@ static void configure_userns(json_object *linux_config, const Options *options)
 		if (options->userns == USERNS_REQUIRED)
 			errx(1, "%s subordinate ID ranges are required",
 			     QM_SUBID_USER);
+		log_verbose(options->verbose,
+			    "No %s subordinate ID ranges; using base namespaces",
+			    QM_SUBID_USER);
 		return;
 	}
 	if (!uid.found || !gid.found)
 		errx(1, "%s requires both subuid and subgid ranges",
 		     QM_SUBID_USER);
+	log_verbose(options->verbose,
+		    "User namespace: uid start=%u count=%u, gid start=%u count=%u",
+		    uid.start, uid.count, gid.start, gid.count);
 
 	if (js_get(linux_config, "uidMappings") ||
 	    js_get(linux_config, "gidMappings"))
@@ -622,6 +745,7 @@ static void configure_isolation(json_object *linux_config,
 {
 	autofree char *parent = cgroup_parent(options->prepare_only);
 	autofree char *payload = join_path(parent, PAYLOAD_CGROUP);
+	log_verbose(options->verbose, "Container cgroup %s", payload);
 	js_set_string(linux_config, "cgroupsPath", payload);
 
 	json_object *namespaces =
@@ -662,17 +786,19 @@ static void configure_annotations(json_object *config)
 
 static json_object *create_config(const Options *options)
 {
+	log_verbose(options->verbose, "Loading OCI configuration from %s",
+		    options->base_config);
 	autofreejson json_object *config = js_load(options->base_config);
 	override_paths(config, options);
 
 	json_object *linux_config = js_need(config, "linux", json_type_object);
 	json_object *process = js_need(config, "process", json_type_object);
-	if (json_object_get_boolean(js_get(process, "terminal")))
-		errx(1, "terminal=true is unsupported");
 	if (js_string(js_need(config, "root", json_type_object), "path")[0] !=
 	    '/')
 		errx(1, "root.path must be absolute");
 
+	log_verbose(options->verbose, "Configuring seccomp from %s",
+		    options->seccomp_file ? options->seccomp_file : "base config");
 	configure_seccomp(linux_config, process, options->seccomp_file);
 	configure_identity(config, process, options->hostname);
 	configure_isolation(linux_config, options);
@@ -685,6 +811,9 @@ static json_object *create_config(const Options *options)
 	configure_device(config, "/dev/kvm", "/dev/kvm");
 	configure_device(config, "/dev/fuse", "/dev/fuse");
 
+	log_verbose(options->verbose,
+		    "OCI configuration ready: hostname=%s rootfs=%s",
+		    options->hostname, js_string(js_get(config, "root"), "path"));
 	return steal_ptr(&config);
 }
 
@@ -744,6 +873,8 @@ static void update_container_file(const Options *options, const char *name,
 
 static int update_resolv_conf(const Options *options)
 {
+	log_verbose(options->verbose, "Updating DNS and hosts files in %s",
+		    options->runtime_dir);
 	autofree char *dns = try_read_text_file(options->resolv_conf);
 	if (!dns && errno != ENOENT)
 		err(1, "read %s", options->resolv_conf);
@@ -798,6 +929,8 @@ static void write_container_files(const Options *options, json_object *config)
 	if (!dns && errno != ENOENT)
 		err(1, "read %s", options->resolv_conf);
 	container_file(files, "resolv.conf", dns ? dns : "", context);
+	log_verbose(options->verbose, "Resolver source %s: %s",
+		    options->resolv_conf, dns ? "read" : "missing; wrote empty file");
 
 	autofree char *hosts = read_text_file("/etc/hosts");
 	autofree char *contents = hosts_contents(hosts, options->hostname);
@@ -806,6 +939,8 @@ static void write_container_files(const Options *options, json_object *config)
 
 static void write_bundle(const Options *options, json_object *config)
 {
+	log_verbose(options->verbose, "Writing container files in %s",
+		    options->runtime_dir);
 	ensure_private_directory(options->runtime_dir);
 	write_container_files(options, config);
 	autofree char *crun_state = join_path(options->runtime_dir, "crun");
@@ -813,6 +948,8 @@ static void write_bundle(const Options *options, json_object *config)
 
 	autofree char *oci_config =
 		join_path(options->runtime_dir, "config.json");
+	log_verbose(options->verbose, "Writing OCI bundle configuration %s",
+		    oci_config);
 	js_save(config, oci_config);
 }
 
@@ -838,6 +975,8 @@ static void usage(FILE *output)
 		"  --userns MODE         auto (default), off, or required; "
 		"auto uses "
 		"%s subids when present\n"
+		"  --verbose             Log startup phases and enable crun debug "
+		"logging\n"
 		"  --prepare-only        Write bundle without privileged "
 		"setup\n"
 		"  --cleanup             Delete container and tear down "
@@ -891,6 +1030,7 @@ static Options parse_options(int argc, char **argv)
 		{"runtime-dir", required_argument, NULL, 'r'},
 		{"resolv-conf", required_argument, NULL, 'R'},
 		{"userns", required_argument, NULL, 'u'},
+		{"verbose", no_argument, NULL, 'V'},
 		{"prepare-only", no_argument, NULL, 'p'},
 		{"cleanup", no_argument, NULL, 'C'},
 		{"update-resolv-conf", no_argument, NULL, 'U'},
@@ -925,6 +1065,9 @@ static Options parse_options(int argc, char **argv)
 			break;
 		case 'u':
 			options.userns = parse_userns_mode(optarg);
+			break;
+		case 'V':
+			options.verbose = true;
 			break;
 		case 'p':
 			options.prepare_only = true;
@@ -1006,14 +1149,16 @@ int main(int argc, char **argv)
 		return exec_in_container(&options);
 
 	if (options.cleanup_only)
-		return cleanup(options.runtime_dir);
+		return cleanup(options.runtime_dir, options.verbose);
 	if (options.update_resolv_conf)
 		return update_resolv_conf(&options);
 
 	if (!options.prepare_only) {
 		if (geteuid() != 0)
 			errx(1, "launch requires root");
-		if (cleanup(options.runtime_dir))
+		log_verbose(options.verbose, "Checking for pending cleanup in %s",
+			    options.runtime_dir);
+		if (cleanup(options.runtime_dir, options.verbose))
 			warnx("cleanup incomplete; continuing startup");
 	}
 
@@ -1034,16 +1179,17 @@ int main(int argc, char **argv)
 	autofreejson json_object *config = create_config(&options);
 	if (options.prepare_only) {
 		write_bundle(&options, config);
+		log_verbose(options.verbose, "Bundle preparation complete");
 		return 0;
 	}
 
 	bool state_created = false;
 	int status = setup(&options, config, &state_created);
 	if (!status)
-		status = crun_run(&options);
+		status = crun_run(&options, config);
 
 	if (state_created)
-		cleanup(options.runtime_dir);
+		cleanup(options.runtime_dir, options.verbose);
 
 	return status;
 }

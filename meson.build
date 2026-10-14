@@ -10,7 +10,7 @@ build_config = configuration_data()
 build_config.set_quoted('QM_DATA_DIR', data_dir)
 configure_file(output: 'config.h', configuration: build_config)
 
-launcher_sources = ['qm-launch.c', 'qm-utils.c', 'qm-network.c', 'qm-state.c']
+launcher_sources = ['qm-launch.c', 'qm-utils.c', 'qm-network.c', 'qm-state.c', 'qm-console.c']
 launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables')]
 launcher = executable('qm-launch', launcher_sources,
   dependencies: launcher_deps, install: true)

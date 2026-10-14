@@ -10,7 +10,10 @@ RequiresMountsFor=/usr/lib/qm/rootfs /etc/qm /var/qm
 [Service]
 # Override service settings with a systemd drop-in for qm2.service.
 # See systemd.resource-control(5) for the resource controls below.
-Type=exec
+# Crun forwards READY=1 from QM's systemd through the inherited NOTIFY_SOCKET.
+# The launcher aliases it in the runtime directory to avoid QM's own notify socket.
+Type=notify
+NotifyAccess=main
 
 # Delegate resource control to QM's nested container manager. Keep the launcher
 # in supervisor so crun can create the sibling payload cgroup for the container.
@@ -65,10 +68,11 @@ RuntimeDirectoryPreserve=yes
 #   msg_max is the messages per queue and msgsize_max is the message size.
 #   The final factor of two leaves headroom for FFI workloads.
 # The seccomp profile comes from the installed QM package.
-ExecStart=@BINDIR@/qm-launch --hostname qm --rootfs ${ROOTFS} --etc-dir ${RWETCFS} --var-dir ${RWVARFS} --seccomp /usr/share/qm/seccomp-no-rt.json @DATADIR@/qm.json
+# Log launcher startup phases and crun debug output by default.
+ExecStart=@BINDIR@/qm-launch --verbose --hostname qm --rootfs ${ROOTFS} --etc-dir ${RWETCFS} --var-dir ${RWVARFS} --seccomp /usr/share/qm/seccomp-no-rt.json @DATADIR@/qm.json
 # Delete surviving crun state, tear down networking and unpin the namespace,
 # including when startup fails.
-ExecStopPost=@BINDIR@/qm-launch --cleanup
+ExecStopPost=@BINDIR@/qm-launch --verbose --cleanup
 
 # Signal foreground crun, which forwards SIGRTMIN+3 to the container's systemd
 # for orderly shutdown. Kill remaining service processes after the timeout.
