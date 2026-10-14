@@ -458,22 +458,29 @@ static int nft_setup(struct nft_ctx *ctx, const NetworkOptions *options,
 	if (nft_command(ctx, table))
 		return -1;
 	autofree char *subnet = xasprintf("%s/%u", options->subnet, options->prefix_len);
+	/* Clamp both SYN and SYN+ACK using current routes, before filtering and
+	 * source NAT. A NAT chain would only see the first packet of a flow.
+	 */
 	autofree char *rules =
-		xasprintf("add chain ip %s forward "
+		xasprintf("add chain ip %s forward_mss "
+			  "{ type filter hook forward priority mangle; policy accept; }\n"
+			  "add rule ip %s forward_mss iifname \"%s\" "
+			  "tcp flags syn tcp option maxseg size set rt mtu\n"
+			  "add rule ip %s forward_mss oifname \"%s\" "
+			  "tcp flags syn tcp option maxseg size set rt mtu\n"
+			  "add chain ip %s forward "
 			  "{ type filter hook forward priority filter; policy accept; }\n"
-			  "add rule ip %s forward "
-			  "oifname \"%s\" ct state established,related accept\n"
 			  "add rule ip %s forward iifname \"%s\" ip saddr %s accept\n"
 			  "add rule ip %s forward iifname \"%s\" drop\n"
-			  "add rule ip %s forward oifname \"%s\" ip daddr %s accept\n"
 			  "add chain ip %s postrouting "
 			  "{ type nat hook postrouting priority srcnat; policy accept; "
 			  "}\n"
 			  "add rule ip %s postrouting "
 			  "ip saddr %s ip daddr != %s masquerade\n",
 			  options->nft_table, options->nft_table, options->veth,
+			  options->nft_table, options->veth, options->nft_table,
 			  options->nft_table, options->veth, subnet, options->nft_table,
-			  options->veth, options->nft_table, options->veth, options->ip,
+			  options->veth,
 			  options->nft_table, options->nft_table, subnet, subnet);
 	/* One transaction installs all chains and rules in the owned table. */
 	return nft_command(ctx, rules);

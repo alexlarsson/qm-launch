@@ -160,6 +160,12 @@ The defaults use subnet `10.90.0.0/24`, gateway `10.90.0.1` and container addres
 `10.90.0.2`; `qmc.conf` can override the addresses and prefix length.
 The interfaces inherit the host's default IPv4 route MTU, falling
 back to 1500 when no default route exists. The MTU is chosen once during setup.
+For forwarded TCP connections, rules scoped to QM's veth clamp the MSS in
+both SYN and SYN+ACK packets using the current route MTU. This accommodates
+an uplink that appears later or has a smaller MTU when a new connection starts.
+It does not adjust existing connections after a route change or solve MTU
+problems for UDP. Path MTU discovery still requires the relevant ICMP messages
+to reach the endpoints, especially for bottlenecks beyond the host's uplink.
 Host uplink configuration can finish later; QM uses the host's routes for
 outbound traffic without binding its NAT rules to a particular uplink address.
 The namespace creation child brings up loopback before pinning the namespace,
@@ -178,6 +184,22 @@ state file, including after crun exits before setup finishes.
 Setup preserves unrelated tables and refuses existing QM
 interface or table names. Cleanup checks the recorded interface and table
 ownership. The fixed interface and table names support one QM instance per host.
+QMC's forwarding filter rejects traffic from QM with a source address outside
+its configured subnet. It permits other forwarded traffic, including unsolicited
+inbound connections to QM when a route exists. Masquerading does not provide an
+inbound access policy. Host-to-QM traffic uses the host output path rather than
+the forwarding filter.
+
+An additional host firewall must permit the intended QM traffic in its own
+policy; QMC's accept verdicts cannot override drops in other base chains.
+Configure forwarding from QM's veth and return traffic, plus any intended
+inbound services, through that firewall's supported configuration mechanism.
+Configure host input/output permissions separately for communication with QM.
+Firewall reloads must preserve `ip qm_launch`; a global `flush ruleset` removes
+QM's NAT, source filtering and MSS rules. QMC installs its rules during setup
+and does not automatically restore them after deletion. A reload that removes
+them must coordinate restarting `qmc.service` after the host policy is applied.
+
 The installed `00-qm-forwarding.conf` enables host IPv4 forwarding early in the
 host sysctl pass, before the remaining IPv4 tuning. Changing `ip_forward` resets
 other IPv4 settings, so the launcher checks that forwarding is enabled and
@@ -269,6 +291,7 @@ changing namespaces or cgroups or applying SELinux labels.
 The optional live smoke test runs with temporary user, mount and network
 namespaces, plus a delegated transient user service. It exercises cgroup
 delegation, native networking, MTU selection, NAT traffic, foreground crun,
+TCP MSS clamping with a late smaller-MTU uplink, host firewall coexistence,
 graceful shutdown, failure rollback and crash recovery. It also checks that
 interface and firewall setup use the same process and links stay down until
 the firewall is ready. It boots container

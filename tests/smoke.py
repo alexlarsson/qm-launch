@@ -27,9 +27,17 @@ def run(*args):
     return result.stdout
 
 
+def wait_until(condition):
+    deadline = time.monotonic() + 5
+    while not condition():
+        assert time.monotonic() < deadline, "Timed out waiting for network setup"
+        time.sleep(0.01)
+
+
 INIT = r'''
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +73,9 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--notify"))
         return kill(1, SIGUSR1) < 0 ? 13 : 0;
-    if (argc == 2 && !strcmp(argv[1], "--network-check")) {
+    if (argc == 2 && (!strcmp(argv[1], "--network-check") ||
+                      !strcmp(argv[1], "--network-bulk"))) {
+        int bulk = !strcmp(argv[1], "--network-bulk");
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         struct timeval timeout = { .tv_sec = 4 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -73,8 +83,41 @@ int main(int argc, char **argv)
         struct sockaddr_in server = { .sin_family = AF_INET, .sin_port = htons(49000) };
         inet_pton(AF_INET, "192.0.2.2", &server.sin_addr);
         const char request[] = "qm-network\n";
-        if (fd < 0 || connect(fd, (struct sockaddr *)&server, sizeof(server)) ||
-            write(fd, request, sizeof(request) - 1) != sizeof(request) - 1)
+        if (fd < 0 || connect(fd, (struct sockaddr *)&server, sizeof(server)))
+            return 10;
+        if (bulk) {
+            int mss;
+            socklen_t length = sizeof(mss);
+            if (getsockopt(fd, IPPROTO_TCP, TCP_MAXSEG, &mss, &length) || mss > 1260)
+                return 18;
+            char data[4096];
+            memset(data, 'Q', sizeof(data));
+            /* Send and receive 256 KiB, checking every byte in each direction. */
+            for (int i = 0; i < 64; i++) {
+                size_t offset = 0;
+                while (offset < sizeof(data)) {
+                    ssize_t count = write(fd, data + offset, sizeof(data) - offset);
+                    if (count <= 0)
+                        return 19;
+                    offset += count;
+                }
+            }
+            for (int i = 0; i < 64; i++) {
+                size_t offset = 0;
+                while (offset < sizeof(data)) {
+                    ssize_t count = read(fd, data + offset, sizeof(data) - offset);
+                    if (count <= 0)
+                        return 20;
+                    offset += count;
+                }
+                for (size_t j = 0; j < sizeof(data); j++)
+                    if (data[j] != 'Q')
+                        return 21;
+            }
+            close(fd);
+            return 0;
+        }
+        if (write(fd, request, sizeof(request) - 1) != sizeof(request) - 1)
             return 10;
         char response[sizeof(request) - 1];
         size_t offset = 0;
@@ -400,6 +443,112 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         run("umount", str(forwarding_path))
         run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
+    # Start without an uplink route: QM retains its 1500 fallback MTU.
+    run("ip", "route", "del", "default")
+    run("ip", "link", "set", "qm-uplink", "down")
+    process, runtime = launch("late-uplink")
+    try:
+        assert select.select([process.stdout], [], [], 10)[0]
+        assert process.stdout.readline() == "READY\n"
+        def late_network_up():
+            result = subprocess.run(["ip", "-j", "link", "show", "qm-veth"],
+                                    text=True, capture_output=True)
+            return result.returncode == 0 and "UP" in json.loads(result.stdout)[0]["flags"]
+        wait_until(late_network_up)
+        for command in (("ip",), ("nsenter", f"--net={runtime / 'netns'}", "ip")):
+            name = "qm-veth" if command == ("ip",) else "eth0"
+            assert json.loads(run(*command, "-j", "link", "show", name))[0]["mtu"] == 1500
+        # Keep the remote endpoint at 1500 so each clamp direction is necessary.
+        run("ip", "netns", "exec", "qm-upstream", "ip", "link", "set", "router", "mtu", "1500")
+        run("ip", "link", "set", "qm-uplink", "mtu", "1300", "up")
+        run("ip", "route", "add", "default", "via", "192.0.2.2")
+        run("nft", "add", "chain", "ip", "unrelated", "output",
+            "{ type filter hook output priority filter; policy accept; }")
+        run("nft", "add", "rule", "ip", "unrelated", "output",
+            "icmp type destination-unreachable icmp code frag-needed drop")
+
+        def bulk_transfer():
+            listener = subprocess.Popen(
+                ["ip", "netns", "exec", "qm-upstream", sys.executable, "-u", "-c",
+                 "import socket\ns = socket.socket()\ns.settimeout(5)\n"
+                 "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                 "s.bind(('192.0.2.2', 49000))\ns.listen()\nprint('LISTENING', flush=True)\n"
+                 "c, peer = s.accept()\nc.settimeout(5)\n"
+                 "assert peer[0] == '192.0.2.1', peer\n"
+                 "assert c.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG) <= 1260\n"
+                 "data = bytearray()\n"
+                 "while len(data) < 262144:\n"
+                 "    chunk = c.recv(262144 - len(data))\n"
+                 "    assert chunk, 'premature EOF'\n    data.extend(chunk)\n"
+                 "assert data == b'Q' * 262144\nc.sendall(data)\nc.close()\n"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                assert select.select([listener.stdout], [], [], 5)[0]
+                assert listener.stdout.readline() == "LISTENING\n"
+                result = subprocess.run(
+                    [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                     "/init", "--network-bulk"], text=True, capture_output=True, timeout=10)
+                stdout, stderr = listener.communicate(timeout=7)
+                return result, listener.returncode, stderr
+            finally:
+                if listener.poll() is None:
+                    listener.kill()
+                    listener.wait()
+
+        result, status, stderr = bulk_transfer()
+        assert result.returncode == status == 0, (result, stderr)
+        # Negative controls prove that neither SYN nor SYN+ACK clamping is redundant.
+        for direction in ("iifname", "oifname"):
+            run("nft", "flush", "chain", "ip", "qm_launch", "forward_mss")
+            run("nft", "add", "rule", "ip", "qm_launch", "forward_mss",
+                f'{direction} "qm-veth" tcp flags syn tcp option maxseg size set rt mtu')
+            result, status, stderr = bulk_transfer()
+            if direction == "iifname":
+                assert result.returncode == 18, (result, stderr)
+            else:
+                assert status != 0 and "AssertionError" in stderr, (result, stderr)
+        run("nft", "add", "rule", "ip", "qm_launch", "forward_mss",
+            'iifname "qm-veth" tcp flags syn tcp option maxseg size set rt mtu')
+        result, status, stderr = bulk_transfer()
+        assert result.returncode == status == 0, (result, stderr)
+
+        # A separate host base chain still controls forwarding. Host reloads
+        # that replace only their own table leave QM's rules installed.
+        run("nft", "add", "chain", "ip", "unrelated", "forward",
+            "{ type filter hook forward priority filter + 10; policy drop; }")
+        result = subprocess.run(
+            ["nsenter", f"--net={runtime / 'netns'}", "ping", "-c", "1", "-W", "1", "192.0.2.2"],
+            text=True, capture_output=True, timeout=5)
+        assert result.returncode != 0
+        run("nft", "add", "rule", "ip", "unrelated", "forward",
+            'iifname "qm-veth" ip saddr 10.90.0.0/24 accept')
+        run("nft", "add", "rule", "ip", "unrelated", "forward",
+            'oifname "qm-veth" ct state established,related accept')
+        run("nsenter", f"--net={runtime / 'netns'}", "ping", "-c", "1", "-W", "2", "192.0.2.2")
+        subprocess.run(["nft", "-f", "-"], input=
+            'delete table ip unrelated\n'
+            'add table ip unrelated\n'
+            'add chain ip unrelated forward { type filter hook forward priority filter + 10; policy drop; }\n'
+            'add rule ip unrelated forward iifname "qm-veth" ip saddr 10.90.0.0/24 accept\n'
+            'add rule ip unrelated forward oifname "qm-veth" ct state established,related accept\n',
+            text=True, check=True, capture_output=True)
+        result, status, stderr = bulk_transfer()
+        assert result.returncode == status == 0, (result, stderr)
+        os.kill(process.pid, signal.SIGRTMIN + 3)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        print("Late uplink MSS clamping in both directions, bulk NAT traffic and host firewall reload passed", flush=True)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
+        run("nft", "delete", "table", "ip", "unrelated")
+        run("nft", "add", "table", "ip", "unrelated")
+        run("ip", "link", "set", "qm-uplink", "mtu", "1400", "up")
+        run("ip", "netns", "exec", "qm-upstream", "ip", "link", "set", "router", "mtu", "1400")
+    assert_network_removed(runtime)
+
     # Crun must wait for payload readiness and forward it as the main process.
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
         notify.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
@@ -650,12 +799,6 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     assert not (prepared / "state.json").exists()
     assert not (prepared / "netns").exists()
     print("Network preparation saves state without changing the host network", flush=True)
-
-    def wait_until(predicate):
-        deadline = time.monotonic() + 5
-        while not predicate():
-            assert time.monotonic() < deadline, "Timed out waiting for network setup"
-            time.sleep(0.01)
 
     # Pause network setup and prove that crun can still boot PID 1.
     for attempt in ("parallel-boot", "async-host-failure", "async-nft-failure",
