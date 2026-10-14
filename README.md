@@ -94,7 +94,9 @@ The service's namespace is pinned at `/run/qm/netns`. The launcher creates
 bridge `qm-br0` and host veth `qm-veth` through rtnetlink, with `eth0` inside
 QM. It uses subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
 `10.90.0.2`. The interfaces inherit the host's default IPv4 route MTU, falling
-back to 1500 when no default route exists.
+back to 1500 when no default route exists. The MTU is chosen once during setup.
+Host uplink configuration can finish later; QM uses the host's routes for
+outbound traffic without binding its NAT rules to a particular uplink address.
 Once the namespace is pinned, the launcher starts network setup in the
 background and execs crun immediately. Container boot overlaps bridge, veth,
 address, route and firewall setup; `eth0` and connectivity become available
@@ -131,6 +133,16 @@ entries, including a custom hostname set at startup. Missing source or runtime
 files are left alone. The watcher stops with `qm2.service`.
 For manual runs, invoke `qmc update-resolv-conf` with the same `--runtime-dir`
 and `--resolv-conf` overrides used at startup.
+
+`qm2.service` uses `DefaultDependencies=no` so it can start before `basic.target`.
+It waits for the mounts backing `/usr/lib/qm/rootfs`, `/etc/qm` and `/var/qm`,
+host filesystem remounting, static device-node setup, tmpfiles setup (including
+`/var/qm/tmp`) and the host sysctl pass.
+The sysctl service is ordered after module loading; completing the pass first
+prevents it from overwriting qmc's network settings. QM does not wait for host
+network connectivity, DNS, D-Bus or all udev events. The DNS updater can also
+run before `basic.target`. Explicit shutdown ordering keeps container shutdown
+and cleanup ahead of filesystem unmounting.
 
 The service uses `KillMode=mixed` and `KillSignal=SIGRTMIN+3`: systemd signals
 foreground crun, which forwards the signal to container PID 1 for orderly

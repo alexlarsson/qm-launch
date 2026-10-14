@@ -4,8 +4,18 @@
 
 [Unit]
 Description=QM container
+# Start as soon as QM's prerequisites are ready, without waiting for basic.target.
+DefaultDependencies=no
 Wants=qm2-resolv-conf.path
 RequiresMountsFor=/usr/lib/qm/rootfs /etc/qm /var/qm
+# Writable host trees, static device nodes and the host sysctl pass must be ready.
+# The sysctl pass is ordered after systemd-modules-load.service.
+After=systemd-remount-fs.service ostree-remount.service systemd-tmpfiles-setup-dev.service systemd-sysctl.service
+# Tmpfiles creates writable bind sources such as /var/qm/tmp.
+After=systemd-tmpfiles-setup.service
+# Restore shutdown ordering removed by DefaultDependencies=no.
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 # Override service settings with a systemd drop-in for qm2.service.

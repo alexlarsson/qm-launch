@@ -4,9 +4,13 @@
 
 [Unit]
 Description=Update QM DNS and hosts configuration
+# Allow updates while the host is still starting its basic services.
+DefaultDependencies=no
 Requisite=qm2.service
 PartOf=qm2.service
 After=qm2.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=oneshot

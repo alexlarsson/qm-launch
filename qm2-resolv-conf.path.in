@@ -4,7 +4,7 @@
 
 [Unit]
 Description=Watch QM host DNS and hosts configuration
-# qm2.service starts after basic.target; avoid the implicit Before=paths.target.
+# Watch after QM is ready without making paths.target wait for container boot.
 DefaultDependencies=no
 BindsTo=qm2.service
 PartOf=qm2.service
