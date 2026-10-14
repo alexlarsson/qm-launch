@@ -18,6 +18,18 @@
 int __real_nft_run_cmd_from_buffer(struct nft_ctx *ctx, const char *command);
 ssize_t __real_mnl_socket_sendto(const struct mnl_socket *nl, const void *buffer,
 				 size_t length);
+int __real_sysctl_write(const char *key, const char *value, bool optional);
+
+int __wrap_sysctl_write(const char *key, const char *value, bool optional)
+{
+	const char *fail = getenv("QM_TEST_SYSCTL_FAIL");
+	if (fail && !strcmp(key, fail)) {
+		errno = EROFS;
+		warn("set sysctl %s", key);
+		return -1;
+	}
+	return __real_sysctl_write(key, value, optional);
+}
 
 static void wait_gate(const char *gate)
 {

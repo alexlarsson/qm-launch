@@ -63,6 +63,7 @@ service and supports running commands in the container with qmc exec.
 %{_datadir}/qm/qmc.conf
 %dir %{_datadir}/qm/qmc.conf.d
 %dir %{_sysconfdir}/qmc.conf.d
+%{_prefix}/lib/sysctl.d/00-qm-forwarding.conf
 %{_prefix}/lib/sysctl.d/90-qm-launch.conf
 
 %changelog

@@ -569,6 +569,19 @@ NetworkState *network_prepare(const NetworkOptions *options)
 {
 	if (validate_options(options))
 		return NULL;
+	/* Host routing policy is established by systemd-sysctl before QM starts.
+	 * Changing ip_forward here would reset other host IPv4 settings.
+	 */
+	autofree char *forwarding = try_read_text_file("/proc/sys/net/ipv4/ip_forward");
+	if (!forwarding) {
+		warn("read host IPv4 forwarding setting");
+		return NULL;
+	}
+	if (strcmp(forwarding, "1\n")) {
+		warnx("host IPv4 forwarding is disabled; apply 00-qm-forwarding.conf "
+		      "with systemd-sysctl before launching QM");
+		return NULL;
+	}
 	const char *runtime_dir = options->runtime_dir;
 	autofree char *owner = network_owner(runtime_dir);
 	if (!owner) {
@@ -633,7 +646,6 @@ int network_setup(const NetworkOptions *options, const NetworkState *state)
 	if (create_veth(&nl, options, owner, ns, mtu) < 0 ||
 	    get_link(&nl, options->veth, 0, &veth) < 0 ||
 	    set_alias(&nl, veth.index, owner) < 0 ||
-	    sysctl_write("net/ipv4/ip_forward", "1", false) ||
 	    sysctl_write(forwarding, "1", false) ||
 	    interface_sysctls(options, options->veth) ||
 	    add_address(&nl, veth.index, options->gateway, options->prefix_len) < 0) {

@@ -225,10 +225,6 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     run("ip", "netns", "exec", "qm-upstream", "ip", "link", "set", "lo", "up")
     run("ip", "route", "add", "default", "via", "192.0.2.2")
     run("nft", "add", "table", "ip", "unrelated")
-    # A host may already forward packets while disabling forwarding on new links.
-    pathlib.Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
-    pathlib.Path("/proc/sys/net/ipv4/conf/default/forwarding").write_text("0\n")
-
     def launch(attempt, extra=(), settings=None, existing_netns=False, notify_socket=None,
                launcher=LAUNCHER, env=None):
         runtime = directory / f"runtime-{attempt}"
@@ -280,6 +276,33 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                 listener.kill()
                 listener.wait()
 
+    forwarding_path = pathlib.Path("/proc/sys/net/ipv4/ip_forward")
+    forwarding_path.write_text("0\n")
+    process, runtime = launch("forwarding-disabled")
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 1, (stdout, stderr)
+    assert "host IPv4 forwarding is disabled" in stderr, stderr
+    assert forwarding_path.read_text().strip() == "0"
+    assert not (runtime / "state.json").exists()
+    run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
+    assert_network_removed(runtime)
+
+    # Apply forwarding before host tuning, just as the installed sysctl files do.
+    # New links can still default to not forwarding even though the host routes.
+    tuning = directory / "50-host-tuning.conf"
+    tuning.write_text("net.ipv4.conf.default.forwarding = 0\n"
+                      "net.ipv4.conf.qm-uplink.accept_redirects = 1\n")
+    run("/usr/lib/systemd/systemd-sysctl", str(SOURCE / "00-qm-forwarding.conf"),
+        str(tuning))
+    assert forwarding_path.read_text().strip() == "1"
+    host_tuning = pathlib.Path("/proc/sys/net/ipv4/conf/qm-uplink/accept_redirects")
+    assert host_tuning.read_text().strip() == "1"
+
+    # A read-only global setting proves that launch never tries to rewrite it.
+    forwarding = directory / "read-only-forwarding"
+    forwarding.write_text("1\n")
+    run("mount", "--bind", str(forwarding), str(forwarding_path))
+    run("mount", "-o", "remount,bind,ro", str(forwarding_path))
     process, runtime = launch('normal with "quotes" and \\slashes', settings={"hostname": "qm-test"})
     try:
         ready = False
@@ -329,6 +352,9 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert veth["mtu"] == eth["mtu"] == 1400
         assert veth["address"] == "02:00:0a:5a:00:01"
         assert veth["ifalias"] == f"qm-launch:{runtime}"
+        assert host_tuning.read_text().strip() == "1"
+        assert pathlib.Path("/proc/sys/net/ipv4/conf/default/forwarding").read_text().strip() == "0"
+        assert pathlib.Path("/proc/sys/net/ipv4/conf/qm-veth/forwarding").read_text().strip() == "1"
         assert "master" not in veth
         assert "qm-br0" not in {link["ifname"] for link in json.loads(run("ip", "-j", "link", "show"))}
         gateway = json.loads(run("ip", "-j", "-4", "addr", "show", "qm-veth"))[0]
@@ -363,11 +389,15 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert process.returncode == 0, stderr
         run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
+        assert forwarding_path.read_text().strip() == "1"
+        assert host_tuning.read_text().strip() == "1"
+        print("Early forwarding configuration and host tuning survive launch and cleanup", flush=True)
         print("Cgroup delegation, native networking, MTU, NAT, exec, signal forwarding and cleanup passed", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
+        run("umount", str(forwarding_path))
         run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
     # Crun must wait for payload readiness and forward it as the main process.
@@ -475,22 +505,16 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             run("umount", executable)
 
     # Fail after veth creation and check that partial setup is rolled back.
-    forwarding = directory / "read-only-forwarding"
-    forwarding.write_text("1\n")
-    target = "/proc/sys/net/ipv4/ip_forward"
-    run("mount", "--bind", str(forwarding), target)
-    run("mount", "-o", "remount,bind,ro", target)
-    try:
-        process, runtime = launch("sysctl-failure")
-        stdout, stderr = process.communicate(timeout=10)
-        assert process.returncode == -signal.SIGKILL, (stdout, stderr)
-        assert "set sysctl net/ipv4/ip_forward" in stderr, stderr
-        assert "QM network setup failed" in stderr, stderr
-        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
-        assert_network_removed(runtime)
-        print("Partial network setup rolls back on sysctl failure", flush=True)
-    finally:
-        run("umount", target)
+    process, runtime = launch("sysctl-failure",
+                              launcher=LAUNCHER.parent / "test-launch-network",
+                              env={"QM_TEST_SYSCTL_FAIL": "net/ipv4/conf/qm-veth/forwarding"})
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == -signal.SIGKILL, (stdout, stderr)
+    assert "set sysctl net/ipv4/conf/qm-veth/forwarding" in stderr, stderr
+    assert "QM network setup failed" in stderr, stderr
+    run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
+    assert_network_removed(runtime)
+    print("Partial network setup rolls back on sysctl failure", flush=True)
 
     # Existing objects are not ours just because their names match.
     for kind in ("interface", "table"):
@@ -649,8 +673,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         if attempt == "async-nft-failure":
             environment["QM_TEST_NFT_FAIL"] = "1"
         if attempt == "async-host-failure":
-            run("mount", "--bind", str(forwarding), target)
-            run("mount", "-o", "remount,bind,ro", target)
+            environment["QM_TEST_SYSCTL_FAIL"] = "net/ipv4/conf/qm-veth/forwarding"
         if attempt == "async-crun-failure":
             config["process"]["args"] = ["/missing-init"]
             base.write_text(json.dumps(config))
@@ -736,8 +759,6 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                 os.close(fd)
             for fd in worker_fds:
                 os.close(fd)
-            if attempt == "async-host-failure":
-                run("umount", target)
             config["process"]["args"] = ["/init"]
             base.write_text(json.dumps(config))
             run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))

@@ -178,8 +178,13 @@ state file, including after crun exits before setup finishes.
 Setup preserves unrelated tables and refuses existing QM
 interface or table names. Cleanup checks the recorded interface and table
 ownership. The fixed interface and table names support one QM instance per host.
-Host IPv4 forwarding remains enabled after cleanup. The installed
-`90-qm-launch.conf` sysctl drop-in preserves interface settings when udev
+The installed `00-qm-forwarding.conf` enables host IPv4 forwarding early in the
+host sysctl pass, before the remaining IPv4 tuning. Changing `ip_forward` resets
+other IPv4 settings, so the launcher checks that forwarding is enabled and
+never changes it. Forwarding remains enabled after cleanup as host policy.
+For manual launches before the host sysctl pass, apply the installed forwarding
+drop-in with `systemd-sysctl` first, then apply the remaining host tuning.
+The installed `90-qm-launch.conf` sysctl drop-in preserves interface settings when udev
 runs systemd-sysctl. Missing interfaces are ignored during the early-boot pass;
 udev applies the settings when the interfaces appear. Setup creates no files
 in `/run/sysctl.d`.
