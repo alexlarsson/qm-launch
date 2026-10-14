@@ -124,6 +124,11 @@ pid_t console_start(const char *path)
 		return -1;
 	}
 	strcpy(address.sun_path, path);
+	/* Startup may be continuing after incomplete cleanup. */
+	if (unlink(path) < 0 && errno != ENOENT) {
+		warn("remove old console socket %s", path);
+		return -1;
+	}
 	int passcred = 1;
 	autoclose int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (listener < 0 ||

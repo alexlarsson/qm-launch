@@ -575,6 +575,16 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.runtime / "netns").exists())
 
+    def test_cleanup_without_state_preserves_empty_runtime_directory(self):
+        self.runtime.mkdir(mode=0o1700)
+        original = self.runtime.stat()
+        command = [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)]
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.runtime.stat().st_ino, original.st_ino)
+        self.assertEqual(self.runtime.stat().st_mode, original.st_mode)
+        self.assertEqual(list(self.runtime.iterdir()), [])
+
     def test_cleanup_uses_recorded_crun_and_namespace(self):
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -659,19 +669,24 @@ class PrepareTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(f"read {missing_config}", result.stderr)
         self.assertFalse(state.exists())
-        self.assertFalse(self.runtime.exists())
+        self.assertTrue(self.runtime.is_dir())
+        self.assertEqual(list(self.runtime.iterdir()), [])
 
-    def test_successful_cleanup_removes_generated_runtime(self):
+    def test_successful_cleanup_preserves_runtime_directory_metadata(self):
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
         (self.runtime / "netns").touch()
         (self.runtime / "state.json").write_text(json.dumps({
             "version": 1, "bundle": str(self.runtime), "netns": str(self.runtime / "netns")}))
+        self.runtime.chmod(0o1700)
+        original = self.runtime.stat()
         command = [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)]
         for _ in range(2):
             result = subprocess.run(command, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(self.runtime.exists())
+            self.assertEqual(self.runtime.stat().st_ino, original.st_ino)
+            self.assertEqual(self.runtime.stat().st_mode, original.st_mode)
+            self.assertEqual(list(self.runtime.iterdir()), [])
 
     def test_cleanup_removes_bundle_without_following_symlinks(self):
         result = self.prepare()
@@ -695,7 +710,8 @@ class PrepareTests(unittest.TestCase):
             [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(self.runtime.exists())
+        self.assertTrue(self.runtime.is_dir())
+        self.assertEqual(list(self.runtime.iterdir()), [])
         self.assertEqual(target.read_text(), "outside the bundle\n")
 
     def test_prepare_preserves_existing_cleanup_state(self):

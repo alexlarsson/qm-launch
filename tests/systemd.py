@@ -142,4 +142,4 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
                 process.kill()
                 process.wait(timeout=5)
             subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)], check=True)
-        assert not runtime.exists()
+        assert runtime.is_dir() and list(runtime.iterdir()) == []

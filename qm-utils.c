@@ -338,11 +338,13 @@ static int remove_tree_entry(const char *path, const struct stat *st, int type,
 {
 	(void)st;
 	(void)type;
-	(void)ftw;
+	/* Preserve the top-level directory, including its ownership and label. */
+	if (ftw->level == 0)
+		return 0;
 	return remove(path) == 0 || errno == ENOENT ? 0 : -1;
 }
 
-int remove_tree(const char *path)
+int remove_tree_contents(const char *path)
 {
 	if (nftw(path, remove_tree_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) < 0 &&
 	    errno != ENOENT) {

@@ -56,10 +56,11 @@ char *try_read_text_file(const char *filename);
 void write_all(int fd, const char *data, size_t length);
 void ensure_private_directory(const char *name);
 void write_text_file(const char *name, const char *contents);
-/* Remove a tree without following symlinks or crossing filesystems.
+/* Remove a directory's contents without removing the directory itself,
+ * following symlinks or crossing filesystems.
  * Missing paths succeed; return 1 and report other errors on stderr.
  */
-int remove_tree(const char *path);
+int remove_tree_contents(const char *path);
 /* Write a slash-separated key under /proc/sys; optional ignores missing keys.
  * Return 0 on success, -1 on failure and report errors on stderr.
  */

@@ -257,7 +257,10 @@ and the network interface names, nftables table and owner. Cleanup uses only
 this recorded state; startup options and current network defaults are not
 needed. A failed
 cleanup retains the state for a retry. Successful cleanup removes the recorded
-bundle directory recursively, including crun caches and the state file.
+bundle contents recursively, including crun caches and the state file. It leaves
+the runtime directory itself intact, preserving systemd's ownership, mode and
+SELinux label. This also applies to manual launches; remove the empty directory
+separately if desired.
 Missing resources count as already cleaned up.
 Normal startup retries cleanup before writing a new bundle, warns if cleanup
 is incomplete, and continues with setup. The service preserves the runtime

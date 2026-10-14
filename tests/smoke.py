@@ -298,7 +298,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert "unrelated" in run("nft", "list", "tables")
         assert not (runtime / "netns").exists()
         assert not (runtime / "state.json").exists()
-        assert not runtime.exists(), [str(path.relative_to(runtime)) for path in runtime.rglob("*")]
+        assert runtime.is_dir()
+        assert list(runtime.iterdir()) == []
 
     def assert_masquerading(*command):
         listener = subprocess.Popen(
@@ -346,6 +347,11 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     forwarding.write_text("1\n")
     run("mount", "--bind", str(forwarding), str(forwarding_path))
     run("mount", "-o", "remount,bind,ro", str(forwarding_path))
+    # Model systemd's pre-created RuntimeDirectory and pin its original inode.
+    runtime = directory / 'runtime-normal with "quotes" and \\slashes'
+    runtime.mkdir(mode=0o1700)
+    runtime_fd = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    original_runtime = os.fstat(runtime_fd)
     process, runtime = launch('normal with "quotes" and \\slashes', settings={"hostname": "qm-test"})
     try:
         ready = False
@@ -365,6 +371,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             stdout, stderr = process.communicate(timeout=5)
             raise RuntimeError(f"container did not start: {stdout}{stderr}")
         assert str(process.pid) in (supervisor / "cgroup.procs").read_text().splitlines()
+        assert runtime.stat().st_ino == original_runtime.st_ino
+        assert runtime.stat().st_mode == original_runtime.st_mode
         assert (service / "payload/init.scope").exists()
         assert (service / "cgroup.procs").read_text() == ""
         assert (runtime / "files/resolv.conf").read_text() == ""
@@ -432,6 +440,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert process.returncode == 0, stderr
         run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
+        assert runtime.stat().st_ino == original_runtime.st_ino
+        assert runtime.stat().st_mode == original_runtime.st_mode
         assert forwarding_path.read_text().strip() == "1"
         assert host_tuning.read_text().strip() == "1"
         print("Early forwarding configuration and host tuning survive launch and cleanup", flush=True)
@@ -442,6 +452,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             process.wait()
         run("umount", str(forwarding_path))
         run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
+        os.close(runtime_fd)
 
     # Start without an uplink route: QM retains its 1500 fallback MTU.
     run("ip", "route", "del", "default")
@@ -679,7 +690,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             assert not (runtime / "state.json").exists()
             assert not (runtime / "netns").exists()
             run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
-            assert not runtime.exists()
+            assert runtime.is_dir() and list(runtime.iterdir()) == []
             if kind == "interface":
                 run("ip", "link", "show", "qm-veth")
             else:
@@ -702,6 +713,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         "version": 1, "bundle": str(runtime),
         "crun": {"executable": "/bin/false", "root": str(old_crun), "id": "qm"}}))
     (runtime / "notify.sock").symlink_to("/run/old-notify.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale_console:
+        stale_console.bind(str(runtime / "console.sock"))
     process, runtime = launch("cleanup-warning", notify_socket="/run/new-notify.sock")
     try:
         assert select.select([process.stdout], [], [], 10)[0]
@@ -713,7 +726,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert "cleanup incomplete; continuing startup" in stderr, stderr
         run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
-        print("Cleanup errors warn while allowing a successful launch", flush=True)
+        print("Partial cleanup preserves stale sockets; startup replaces them and launches successfully", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
