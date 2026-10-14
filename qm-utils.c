@@ -83,14 +83,12 @@ char *join_path(const char *a, const char *b)
 	while (*b == '/')
 		b++;
 
-	return xasprintf("%s%s%s", a, *a && a[strlen(a) - 1] != '/' ? "/" : "",
-			 b);
+	return xasprintf("%s%s%s", a, *a && a[strlen(a) - 1] != '/' ? "/" : "", b);
 }
 
 char *try_read_text_file(const char *filename)
 {
-	autoclose int fd =
-		TEMP_FAILURE_RETRY(open(filename, O_RDONLY | O_CLOEXEC));
+	autoclose int fd = TEMP_FAILURE_RETRY(open(filename, O_RDONLY | O_CLOEXEC));
 	if (fd < 0)
 		return NULL;
 
@@ -102,8 +100,8 @@ char *try_read_text_file(const char *filename)
 			buffer = xrealloc(buffer, size);
 		}
 
-		ssize_t count = TEMP_FAILURE_RETRY(
-			read(fd, buffer + length, size - length - 1));
+		ssize_t count =
+			TEMP_FAILURE_RETRY(read(fd, buffer + length, size - length - 1));
 		if (count < 0) {
 			int saved_errno = errno;
 			close(fd);
@@ -239,8 +237,7 @@ json_object *js_load(const char *filename)
 {
 	autofree char *contents = read_text_file(filename);
 	enum json_tokener_error error;
-	autofreejson json_object *result =
-		json_tokener_parse_verbose(contents, &error);
+	autofreejson json_object *result = json_tokener_parse_verbose(contents, &error);
 	if (error != json_tokener_success)
 		errx(1, "%s: %s", filename, json_tokener_error_desc(error));
 	if (!json_object_is_type(result, json_type_object))
@@ -279,8 +276,7 @@ void js_save_atomic(json_object *object, const char *filename, bool replace)
 	/* link() publishes the initial state without replacing another launch's
 	 * state. Subsequent snapshots replace the old file with rename().
 	 */
-	int result = replace ? rename(temporary, filename)
-			     : link(temporary, filename);
+	int result = replace ? rename(temporary, filename) : link(temporary, filename);
 	if (result < 0) {
 		int saved_errno = errno;
 		unlink(temporary);
@@ -313,11 +309,8 @@ void ensure_private_directory(const char *name)
 	struct stat st;
 	if (lstat(name, &st) < 0)
 		err(1, "stat %s", name);
-	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
-	    (st.st_mode & 0077))
-		errx(1,
-		     "%s must be a private directory owned by the current user",
-		     name);
+	if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0077))
+		errx(1, "%s must be a private directory owned by the current user", name);
 }
 
 void write_all(int fd, const char *data, size_t length)
@@ -334,9 +327,8 @@ void write_all(int fd, const char *data, size_t length)
 
 void write_text_file(const char *name, const char *contents)
 {
-	autoclose int fd = TEMP_FAILURE_RETRY(open(
-		name, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-		0644));
+	autoclose int fd = TEMP_FAILURE_RETRY(
+		open(name, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644));
 	if (fd < 0)
 		err(1, "open %s", name);
 
@@ -364,15 +356,12 @@ int remove_tree(const char *path)
 
 void set_selinux_label(const char *name, const char *context)
 {
-	if (context && *context &&
-	    access("/sys/fs/selinux/enforce", F_OK) == 0 &&
-	    setxattr(name, "security.selinux", context, strlen(context) + 1,
-		     0) < 0)
+	if (context && *context && access("/sys/fs/selinux/enforce", F_OK) == 0 &&
+	    setxattr(name, "security.selinux", context, strlen(context) + 1, 0) < 0)
 		err(1, "label %s", name);
 }
 
-IdRange read_subid(const char *directory, const char *filename,
-		   const char *username)
+IdRange read_subid(const char *directory, const char *filename, const char *username)
 {
 	autofree char *path = join_path(directory, filename);
 	FILE *file = fopen(path, "r");
@@ -410,12 +399,10 @@ IdRange read_subid(const char *directory, const char *filename,
 		errno = 0;
 		unsigned long long count = strtoull(second, &end, 10);
 		if (errno || !*second || *end || !count || start > UINT32_MAX ||
-		    count > UINT32_MAX ||
-		    start + count > (uint64_t)UINT32_MAX + 1)
+		    count > UINT32_MAX || start + count > (uint64_t)UINT32_MAX + 1)
 			errx(1, "invalid %s size in %s", username, path);
 
-		result = (IdRange){
-			.found = true, .start = start, .count = count};
+		result = (IdRange){.found = true, .start = start, .count = count};
 	}
 
 	if (ferror(file))

@@ -23,8 +23,7 @@ int __wrap_ftruncate64(int fd, off64_t length)
 			err(1, "readlink %s", source);
 		target[length] = '\0';
 		const char *name = strrchr(target, '/');
-		autofree char *snapshot =
-			join_path(directory, name ? name + 1 : target);
+		autofree char *snapshot = join_path(directory, name ? name + 1 : target);
 		autofree char *contents = read_text_file(source);
 		write_text_file(snapshot, contents);
 	}

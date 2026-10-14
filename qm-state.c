@@ -24,8 +24,7 @@ json_object *state_serialize(const State *state)
 	if (state->netns)
 		js_set_string(object, "netns", state->netns);
 	if (state->network)
-		js_object_add(object, "network",
-			      network_state_serialize(state->network));
+		js_object_add(object, "network", network_state_serialize(state->network));
 	return object;
 }
 

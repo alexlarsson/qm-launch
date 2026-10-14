@@ -27,8 +27,10 @@ int main(int argc, char **argv)
 	if (config->seccomp_file)
 		js_set_string(result, "seccomp", config->seccomp_file);
 	js_set_string(result, "resolv-conf", config->resolv_conf);
-	js_set_string(result, "userns", config->userns == USERNS_AUTO ? "auto" :
-		      config->userns == USERNS_OFF ? "off" : "required");
+	js_set_string(result, "userns",
+		      config->userns == USERNS_AUTO  ? "auto"
+		      : config->userns == USERNS_OFF ? "off"
+						     : "required");
 	js_object_add(result, "verbose", js_new_bool(config->verbose));
 	puts(json_object_to_json_string(result));
 	return 0;

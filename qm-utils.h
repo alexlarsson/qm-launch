@@ -73,8 +73,7 @@ typedef struct {
 } IdRange;
 
 /* Return .found=false when the file or username has no subordinate-ID range. */
-IdRange read_subid(const char *directory, const char *filename,
-		   const char *username);
+IdRange read_subid(const char *directory, const char *filename, const char *username);
 
 /* Return an allocated path for the calling process's cgroup v2 membership. */
 char *get_current_cgroup(void);

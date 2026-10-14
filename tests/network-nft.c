@@ -15,8 +15,8 @@
 #include <string.h>
 
 int __real_nft_run_cmd_from_buffer(struct nft_ctx *ctx, const char *command);
-ssize_t __real_mnl_socket_sendto(const struct mnl_socket *nl,
-			       const void *buffer, size_t length);
+ssize_t __real_mnl_socket_sendto(const struct mnl_socket *nl, const void *buffer,
+				 size_t length);
 
 static void wait_gate(const char *gate)
 {
@@ -29,8 +29,8 @@ static void wait_gate(const char *gate)
 		errx(1, "release network test gate");
 }
 
-ssize_t __wrap_mnl_socket_sendto(const struct mnl_socket *nl,
-			       const void *buffer, size_t length)
+ssize_t __wrap_mnl_socket_sendto(const struct mnl_socket *nl, const void *buffer,
+				 size_t length)
 {
 	const struct nlmsghdr *header = buffer;
 	const char *gate = getenv("QM_TEST_LINK_GATE");

@@ -4,8 +4,8 @@
  */
 
 #define _GNU_SOURCE
-#include "config.h"
 #include "qm-config.h"
+#include "config.h"
 #include "qm-utils.h"
 
 #include <dirent.h>
@@ -53,8 +53,7 @@ static const char *const userns_names[] = {
 
 static bool string_type(ConfigValueType type)
 {
-	return type == CONFIG_STRING || type == CONFIG_PATH ||
-	       type == CONFIG_HOSTNAME;
+	return type == CONFIG_STRING || type == CONFIG_PATH || type == CONFIG_HOSTNAME;
 }
 
 void config_free(Config *config)
@@ -69,8 +68,8 @@ void config_free(Config *config)
 	free(config);
 }
 
-static void parse_entry(Config *config, const ConfigEntry *entry,
-			json_object *value, const char *filename)
+static void parse_entry(Config *config, const ConfigEntry *entry, json_object *value,
+			const char *filename)
 {
 	bool boolean = entry->type == CONFIG_BOOL;
 	if (!json_object_is_type(value, boolean ? json_type_boolean : json_type_string))
@@ -88,14 +87,14 @@ static void parse_entry(Config *config, const ConfigEntry *entry,
 	switch (entry->type) {
 	case CONFIG_PATH:
 		if (string[0] != '/')
-			errx(1, "%s: %s must be an absolute path: %s",
-			     filename, entry->name, string);
+			errx(1, "%s: %s must be an absolute path: %s", filename,
+			     entry->name, string);
 		break;
 	case CONFIG_HOSTNAME:
 		if (!*string || strlen(string) > 64 ||
 		    strspn(string, "abcdefghijklmnopqrstuvwxyz"
-				  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-				  "0123456789.-") != strlen(string))
+				   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+				   "0123456789.-") != strlen(string))
 			errx(1, "%s: invalid hostname", filename);
 		break;
 	case CONFIG_USERNS:
@@ -142,7 +141,7 @@ static void merge_file(Config *config, const char *filename, bool optional)
 	if (!json_object_is_type(layer, json_type_object))
 		errx(1, "%s: expected a JSON object", filename);
 
-	json_object_object_foreach(layer, key, value) {
+	json_object_object_foreach (layer, key, value) {
 		const ConfigEntry *entry = NULL;
 		for (size_t i = 0; i < N_ELEMENTS(config_entries); i++) {
 			if (!strcmp(key, config_entries[i].name)) {
@@ -189,15 +188,16 @@ static void merge_directory(Config *config, const char *directory)
 }
 
 Config *configuration_load(const char *vendor_dir, const char *admin_dir,
-				const char *filename)
+			   const char *filename)
 {
 	autofreeconfig Config *config = xnew(Config);
 	*config = (Config){
 		.base_config = xstrdup(QM_DATA_DIR "/qm.json"),
 		.hostname = xstrdup(DEFAULT_HOSTNAME),
-		.resolv_conf = xstrdup(access("/run/systemd/resolve/resolv.conf", R_OK) == 0
-				      ? "/run/systemd/resolve/resolv.conf"
-				      : "/etc/resolv.conf"),
+		.resolv_conf =
+			xstrdup(access("/run/systemd/resolve/resolv.conf", R_OK) == 0
+					? "/run/systemd/resolve/resolv.conf"
+					: "/etc/resolv.conf"),
 		.userns = USERNS_AUTO,
 	};
 	if (filename)

@@ -55,12 +55,11 @@ static void rtnl_close(Rtnl *nl)
 static int rtnl_open(Rtnl *nl)
 {
 	nl->socket = mnl_socket_open2(NETLINK_ROUTE, SOCK_CLOEXEC);
-	if (!nl->socket ||
-	    mnl_socket_bind(nl->socket, 0, MNL_SOCKET_AUTOPID) < 0)
+	if (!nl->socket || mnl_socket_bind(nl->socket, 0, MNL_SOCKET_AUTOPID) < 0)
 		return -1;
 	struct timeval timeout = {.tv_sec = 5};
-	return setsockopt(mnl_socket_get_fd(nl->socket), SOL_SOCKET,
-			  SO_RCVTIMEO, &timeout, sizeof(timeout));
+	return setsockopt(mnl_socket_get_fd(nl->socket), SOL_SOCKET, SO_RCVTIMEO,
+			  &timeout, sizeof(timeout));
 }
 
 static struct nlmsghdr *message_init(Message *message, unsigned int type,
@@ -72,8 +71,7 @@ static struct nlmsghdr *message_init(Message *message, unsigned int type,
 	return header;
 }
 
-static int rtnl_request(Rtnl *nl, struct nlmsghdr *header, mnl_cb_t callback,
-			void *data)
+static int rtnl_request(Rtnl *nl, struct nlmsghdr *header, mnl_cb_t callback, void *data)
 {
 	header->nlmsg_seq = ++nl->sequence;
 	if (mnl_socket_sendto(nl->socket, header, header->nlmsg_len) < 0)
@@ -81,13 +79,12 @@ static int rtnl_request(Rtnl *nl, struct nlmsghdr *header, mnl_cb_t callback,
 	char response[32768];
 	int result;
 	do {
-		ssize_t length = TEMP_FAILURE_RETRY(mnl_socket_recvfrom(
-			nl->socket, response, sizeof(response)));
+		ssize_t length = TEMP_FAILURE_RETRY(
+			mnl_socket_recvfrom(nl->socket, response, sizeof(response)));
 		if (length < 0)
 			return -1;
 		result = mnl_cb_run(response, length, nl->sequence,
-				    mnl_socket_get_portid(nl->socket), callback,
-				    data);
+				    mnl_socket_get_portid(nl->socket), callback, data);
 	} while (result > 0);
 	return result;
 }
@@ -134,8 +131,7 @@ static int link_reply(const struct nlmsghdr *header, void *data)
 				link->group = mnl_attr_get_u32(attr);
 		} else if (mnl_attr_get_type(attr) == IFLA_IFALIAS) {
 			if (mnl_attr_validate(attr, MNL_TYPE_NUL_STRING) < 0 ||
-			    mnl_attr_get_payload_len(attr) >
-				    sizeof(link->alias)) {
+			    mnl_attr_get_payload_len(attr) > sizeof(link->alias)) {
 				errno = EPROTO;
 				return MNL_CB_ERROR;
 			}
@@ -150,10 +146,8 @@ static int get_link(Rtnl *nl, const char *name, int index, Link *link)
 {
 	*link = (Link){0};
 	Message message;
-	struct nlmsghdr *header =
-		message_init(&message, RTM_GETLINK, NLM_F_ACK);
-	struct ifinfomsg *info =
-		mnl_nlmsg_put_extra_header(header, sizeof(*info));
+	struct nlmsghdr *header = message_init(&message, RTM_GETLINK, NLM_F_ACK);
+	struct ifinfomsg *info = mnl_nlmsg_put_extra_header(header, sizeof(*info));
 	info->ifi_family = AF_UNSPEC;
 	info->ifi_index = index;
 	if (name)
@@ -203,8 +197,7 @@ static int route_reply(const struct nlmsghdr *header, void *data)
 static int default_mtu(Rtnl *nl, uint32_t fallback, uint32_t *mtu)
 {
 	Message message;
-	struct nlmsghdr *header =
-		message_init(&message, RTM_GETROUTE, NLM_F_DUMP);
+	struct nlmsghdr *header = message_init(&message, RTM_GETROUTE, NLM_F_DUMP);
 	struct rtmsg *info = mnl_nlmsg_put_extra_header(header, sizeof(*info));
 	info->rtm_family = AF_INET;
 	DefaultRoute route = {0};
@@ -221,12 +214,12 @@ static int default_mtu(Rtnl *nl, uint32_t fallback, uint32_t *mtu)
 	return 0;
 }
 
-static int create_bridge(Rtnl *nl, const NetworkOptions *options,
-			 const char *owner, uint32_t mtu)
+static int create_bridge(Rtnl *nl, const NetworkOptions *options, const char *owner,
+			 uint32_t mtu)
 {
 	Message message;
-	struct nlmsghdr *header = message_init(
-		&message, RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+	struct nlmsghdr *header = message_init(&message, RTM_NEWLINK,
+					       NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
 	mnl_nlmsg_put_extra_header(header, sizeof(struct ifinfomsg));
 	mnl_attr_put_strz(header, IFLA_IFNAME, options->bridge);
 	/* Unlike aliases, the group is applied during link creation. It covers
@@ -243,12 +236,12 @@ static int create_bridge(Rtnl *nl, const NetworkOptions *options,
 	return rtnl_request(nl, header, NULL, NULL);
 }
 
-static int create_veth(Rtnl *nl, const NetworkOptions *options,
-		       const char *owner, int bridge, int netns, uint32_t mtu)
+static int create_veth(Rtnl *nl, const NetworkOptions *options, const char *owner,
+		       int bridge, int netns, uint32_t mtu)
 {
 	Message message;
-	struct nlmsghdr *header = message_init(
-		&message, RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+	struct nlmsghdr *header = message_init(&message, RTM_NEWLINK,
+					       NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
 	mnl_nlmsg_put_extra_header(header, sizeof(struct ifinfomsg));
 	mnl_attr_put_strz(header, IFLA_IFNAME, options->veth);
 	mnl_attr_put_u32(header, IFLA_GROUP, owner_group(owner));
@@ -271,10 +264,9 @@ static int create_veth(Rtnl *nl, const NetworkOptions *options,
 static int link_change(Rtnl *nl, int index, bool remove)
 {
 	Message message;
-	struct nlmsghdr *header = message_init(
-		&message, remove ? RTM_DELLINK : RTM_NEWLINK, NLM_F_ACK);
-	struct ifinfomsg *info =
-		mnl_nlmsg_put_extra_header(header, sizeof(*info));
+	struct nlmsghdr *header =
+		message_init(&message, remove ? RTM_DELLINK : RTM_NEWLINK, NLM_F_ACK);
+	struct ifinfomsg *info = mnl_nlmsg_put_extra_header(header, sizeof(*info));
 	info->ifi_index = index;
 	if (!remove) {
 		info->ifi_flags = IFF_UP;
@@ -286,23 +278,19 @@ static int link_change(Rtnl *nl, int index, bool remove)
 static int set_alias(Rtnl *nl, int index, const char *owner)
 {
 	Message message;
-	struct nlmsghdr *header =
-		message_init(&message, RTM_SETLINK, NLM_F_ACK);
-	struct ifinfomsg *info =
-		mnl_nlmsg_put_extra_header(header, sizeof(*info));
+	struct nlmsghdr *header = message_init(&message, RTM_SETLINK, NLM_F_ACK);
+	struct ifinfomsg *info = mnl_nlmsg_put_extra_header(header, sizeof(*info));
 	info->ifi_index = index;
 	mnl_attr_put(header, IFLA_IFALIAS, strlen(owner), owner);
 	return rtnl_request(nl, header, NULL, NULL);
 }
 
-static int add_address(Rtnl *nl, int index, const char *address,
-		       unsigned int prefix_len)
+static int add_address(Rtnl *nl, int index, const char *address, unsigned int prefix_len)
 {
 	Message message;
-	struct nlmsghdr *header = message_init(
-		&message, RTM_NEWADDR, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-	struct ifaddrmsg *info =
-		mnl_nlmsg_put_extra_header(header, sizeof(*info));
+	struct nlmsghdr *header = message_init(&message, RTM_NEWADDR,
+					       NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+	struct ifaddrmsg *info = mnl_nlmsg_put_extra_header(header, sizeof(*info));
 	info->ifa_family = AF_INET;
 	info->ifa_prefixlen = prefix_len;
 	info->ifa_index = index;
@@ -319,8 +307,8 @@ static int add_address(Rtnl *nl, int index, const char *address,
 static int add_default_route(Rtnl *nl, int index, const char *address)
 {
 	Message message;
-	struct nlmsghdr *header = message_init(
-		&message, RTM_NEWROUTE, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+	struct nlmsghdr *header = message_init(&message, RTM_NEWROUTE,
+					       NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
 	struct rtmsg *info = mnl_nlmsg_put_extra_header(header, sizeof(*info));
 	info->rtm_family = AF_INET;
 	info->rtm_table = RT_TABLE_MAIN;
@@ -339,10 +327,8 @@ static int add_default_route(Rtnl *nl, int index, const char *address)
 
 static int interface_sysctls(const NetworkOptions *options, const char *name)
 {
-	autofree char *rp_filter =
-		xasprintf("net/ipv4/conf/%s/rp_filter", name);
-	autofree char *disable_ipv6 =
-		xasprintf("net/ipv6/conf/%s/disable_ipv6", name);
+	autofree char *rp_filter = xasprintf("net/ipv4/conf/%s/rp_filter", name);
+	autofree char *disable_ipv6 = xasprintf("net/ipv6/conf/%s/disable_ipv6", name);
 	autofree char *filter = xasprintf("%u", options->rp_filter);
 	return sysctl_write(rp_filter, filter, false) ||
 	       sysctl_write(disable_ipv6, options->disable_ipv6 ? "1" : "0", true);
@@ -363,10 +349,9 @@ static int configure_namespace(const NetworkOptions *options, int netns)
 			_exit(1);
 		autortnl Rtnl nl = {0};
 		Link eth, lo;
-		int result = setns(netns, CLONE_NEWNET) < 0 ||
-			     rtnl_open(&nl) < 0 ||
-			     get_link(&nl, options->interface, 0, &eth) < 0 || !eth.index ||
-			     get_link(&nl, "lo", 0, &lo) < 0 || !lo.index ||
+		int result = setns(netns, CLONE_NEWNET) < 0 || rtnl_open(&nl) < 0 ||
+			     get_link(&nl, options->interface, 0, &eth) < 0 ||
+			     !eth.index || get_link(&nl, "lo", 0, &lo) < 0 || !lo.index ||
 			     interface_sysctls(options, options->interface) ||
 			     add_address(&nl, eth.index, options->ip,
 					 options->prefix_len) < 0 ||
@@ -426,10 +411,7 @@ static int nft_owner(struct nft_ctx *ctx, const char *name, const char *owner)
 		if (!table || strcmp(js_string(table, "name"), name))
 			continue;
 		json_object *comment = js_get(table, "comment");
-		return comment && !strcmp(json_object_get_string(comment),
-					  owner)
-			       ? 1
-			       : 2;
+		return comment && !strcmp(json_object_get_string(comment), owner) ? 1 : 2;
 	}
 	return 0;
 }
@@ -439,14 +421,14 @@ static int nft_setup(struct nft_ctx *ctx, const NetworkOptions *options,
 {
 	autofreejson json_object *quoted = js_new_string(owner);
 	/* JSON preserves arbitrary path characters in the ownership comment. */
-	autofree char *table = xasprintf(
-		"{\"nftables\":[{\"create\":{\"table\":{\"family\":\"ip\","
-		"\"name\":\"%s\",\"comment\":%s}}}]}", options->nft_table,
-		json_object_to_json_string_ext(quoted, JSON_C_TO_STRING_PLAIN));
+	autofree char *table =
+		xasprintf("{\"nftables\":[{\"create\":{\"table\":{\"family\":\"ip\","
+			  "\"name\":\"%s\",\"comment\":%s}}}]}",
+			  options->nft_table,
+			  json_object_to_json_string_ext(quoted, JSON_C_TO_STRING_PLAIN));
 	if (nft_command(ctx, table))
 		return -1;
-	autofree char *subnet = xasprintf("%s/%u", options->subnet,
-					options->prefix_len);
+	autofree char *subnet = xasprintf("%s/%u", options->subnet, options->prefix_len);
 	autofree char *rules = xasprintf(
 		"add chain ip %s forward "
 		"{ type filter hook forward priority filter; policy accept; }\n"
@@ -460,13 +442,10 @@ static int nft_setup(struct nft_ctx *ctx, const NetworkOptions *options,
 		"}\n"
 		"add rule ip %s postrouting "
 		"ip saddr %s ip daddr != %s masquerade\n",
-		options->nft_table,
-		options->nft_table, options->bridge,
-		options->nft_table, options->bridge, subnet,
-		options->nft_table, options->bridge,
-		options->nft_table, options->bridge, options->ip,
-		options->nft_table,
-		options->nft_table, subnet, subnet);
+		options->nft_table, options->nft_table, options->bridge,
+		options->nft_table, options->bridge, subnet, options->nft_table,
+		options->bridge, options->nft_table, options->bridge, options->ip,
+		options->nft_table, options->nft_table, subnet, subnet);
 	/* One transaction installs all chains and rules in the owned table. */
 	return nft_command(ctx, rules);
 }
@@ -507,8 +486,7 @@ static int validate_options(const NetworkOptions *options)
 {
 	if (!valid_interface(options->bridge) || !valid_interface(options->veth) ||
 	    !valid_interface(options->interface) || !valid_table(options->nft_table) ||
-	    options->prefix_len > 32 || options->rp_filter > 2 ||
-	    !options->fallback_mtu)
+	    options->prefix_len > 32 || options->rp_filter > 2 || !options->fallback_mtu)
 		goto invalid;
 	const char *addresses[] = {options->ip, options->gateway, options->subnet};
 	for (size_t i = 0; i < N_ELEMENTS(addresses); i++) {
@@ -623,8 +601,7 @@ int network_setup(const NetworkOptions *options, const NetworkState *state)
 		return 1;
 	}
 	autofree char *netns = join_path(options->runtime_dir, "netns");
-	autoclose int ns =
-		TEMP_FAILURE_RETRY(open(netns, O_RDONLY | O_CLOEXEC));
+	autoclose int ns = TEMP_FAILURE_RETRY(open(netns, O_RDONLY | O_CLOEXEC));
 	if (ns < 0) {
 		warn("open %s", netns);
 		return 1;
@@ -638,8 +615,7 @@ int network_setup(const NetworkOptions *options, const NetworkState *state)
 	    sysctl_write("net/ipv4/ip_forward", "1", false) ||
 	    sysctl_write(forwarding, "1", false) ||
 	    interface_sysctls(options, options->bridge) ||
-	    add_address(&nl, bridge.index, options->gateway,
-			options->prefix_len) < 0 ||
+	    add_address(&nl, bridge.index, options->gateway, options->prefix_len) < 0 ||
 	    create_veth(&nl, options, owner, bridge.index, ns, mtu) < 0 ||
 	    get_link(&nl, options->veth, 0, &veth) < 0 ||
 	    set_alias(&nl, veth.index, owner) < 0 ||
@@ -698,8 +674,7 @@ int network_teardown(const NetworkState *state)
 	if (table < 0)
 		result = 1;
 	else if (table == 1) {
-		autofree char *command = xasprintf("delete table ip %s\n",
-						 nft_table);
+		autofree char *command = xasprintf("delete table ip %s\n", nft_table);
 		result |= nft_command(nft, command) != 0;
 	} else if (table == 2) {
 		warnx("nftables table %s belongs to another owner; leaving it "

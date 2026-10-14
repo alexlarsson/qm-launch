@@ -37,4 +37,4 @@ static inline void cleanup_config(Config **config)
  * Failures report the offending file and exit.
  */
 Config *configuration_load(const char *vendor_dir, const char *admin_dir,
-				const char *filename);
+			   const char *filename);

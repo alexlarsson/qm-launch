@@ -2,3 +2,4 @@
 /__pycache__/
 !/qm.json
 !/seccomp-no-rt.json
+*~

@@ -5,9 +5,9 @@
 
 #pragma once
 
+#include <json-c/json.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <json-c/json.h>
 
 typedef struct {
 	const char *runtime_dir;

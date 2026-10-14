@@ -49,8 +49,8 @@ static void console_forward(int listener, const char *path, pid_t parent)
 		.msg_control = control.bytes,
 		.msg_controllen = sizeof(control.bytes),
 	};
-	ssize_t count = TEMP_FAILURE_RETRY(
-		recvmsg(connection, &message, MSG_CMSG_CLOEXEC));
+	ssize_t count =
+		TEMP_FAILURE_RETRY(recvmsg(connection, &message, MSG_CMSG_CLOEXEC));
 	if (count < 0)
 		err(1, "receive console");
 	if (count == 0 || (message.msg_flags & MSG_CTRUNC))
@@ -128,8 +128,8 @@ pid_t console_start(const char *path)
 	autoclose int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (listener < 0 ||
 	    bind(listener, (struct sockaddr *)&address, sizeof(address)) < 0 ||
-	    setsockopt(listener, SOL_SOCKET, SO_PASSCRED, &passcred,
-		       sizeof(passcred)) < 0 ||
+	    setsockopt(listener, SOL_SOCKET, SO_PASSCRED, &passcred, sizeof(passcred)) <
+		    0 ||
 	    listen(listener, 1) < 0) {
 		warn("listen on console socket %s", path);
 		return -1;
