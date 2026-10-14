@@ -14,6 +14,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent
 LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
@@ -228,17 +229,19 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     pathlib.Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
     pathlib.Path("/proc/sys/net/ipv4/conf/default/forwarding").write_text("0\n")
 
-    def launch(attempt, extra=(), existing_netns=False, notify_socket=None):
+    def launch(attempt, extra=(), existing_netns=False, notify_socket=None,
+               launcher=LAUNCHER, env=None):
         runtime = directory / f"runtime-{attempt}"
         if existing_netns:
             runtime.mkdir(mode=0o700)
             (runtime / "netns").touch()
 
         environment = {**os.environ, "RUNTIME_DIRECTORY": str(runtime)}
+        environment.update(env or {})
         if notify_socket is not None:
             environment["NOTIFY_SOCKET"] = str(notify_socket)
         process = subprocess.Popen(
-            [str(LAUNCHER),
+            [str(launcher),
              "--seccomp", str(SOURCE / "tests/seccomp-no-rt.json"),
              "--resolv-conf", str(resolv), "--userns", "off",
              *extra, str(base)],
@@ -471,8 +474,10 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     try:
         process, runtime = launch("sysctl-failure")
         stdout, stderr = process.communicate(timeout=10)
-        assert process.returncode == 1, (stdout, stderr)
+        assert process.returncode == -signal.SIGKILL, (stdout, stderr)
         assert "set sysctl net/ipv4/ip_forward" in stderr, stderr
+        assert "QM network setup failed" in stderr, stderr
+        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Partial network setup rolls back on sysctl failure", flush=True)
     finally:
@@ -609,6 +614,121 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     assert not (prepared / "state.json").exists()
     assert not (prepared / "netns").exists()
     print("Network preparation saves cleanup state without changing the network", flush=True)
+
+    def wait_until(predicate):
+        deadline = time.monotonic() + 5
+        while not predicate():
+            assert time.monotonic() < deadline, "Timed out waiting for network setup"
+            time.sleep(0.01)
+
+    # Pause network setup and prove that crun can still boot PID 1.
+    for attempt in ("parallel-boot", "async-host-failure", "async-nft-failure",
+                    "job-crash", "parent-crash", "concurrent-cleanup", "async-crun-failure"):
+        gates = []
+        worker_fds = []
+        environment = {}
+        kinds = (("LINK", "NFT") if attempt == "parallel-boot" else
+                 ("NFT",) if attempt == "async-nft-failure" else ("LINK",))
+        for kind in kinds:
+            gate = directory / f"gate-{attempt}-{kind}"
+            os.mkfifo(gate, 0o600)
+            gates.append((gate, os.open(gate, os.O_RDWR | os.O_CLOEXEC)))
+            environment[f"QM_TEST_{kind}_GATE"] = str(gate)
+        if attempt == "async-nft-failure":
+            environment["QM_TEST_NFT_FAIL"] = "1"
+        if attempt == "async-host-failure":
+            run("mount", "--bind", str(forwarding), target)
+            run("mount", "-o", "remount,bind,ro", target)
+        if attempt == "async-crun-failure":
+            config["process"]["args"] = ["/missing-init"]
+            base.write_text(json.dumps(config))
+        process, runtime = launch(attempt, extra=("--verbose",),
+                                  launcher=LAUNCHER.parent / "test-launch-network",
+                                  env=environment)
+        concurrent_cleanup = None
+        try:
+            if attempt == "async-crun-failure":
+                stdout, stderr = process.communicate(timeout=5)
+                assert process.returncode != 0, (stdout, stderr)
+                assert "/missing-init" in stderr, stderr
+            else:
+                gate, fd = gates[0]
+                pid_file = pathlib.Path(f"{gate}.pid")
+                wait_until(lambda: pid_file.exists() and pid_file.read_text().strip())
+                worker_pid = int(pid_file.read_text())
+                worker_fds.append(os.pidfd_open(worker_pid))
+                assert select.select([process.stdout], [], [], 5)[0]
+                assert process.stdout.readline() == "READY\n", "Init waited for network setup"
+                assert pathlib.Path(f"/proc/{process.pid}/comm").read_text().strip() == "crun"
+                if kinds[0] == "LINK":
+                    assert "qm-br0" not in run("ip", "link", "show")
+                else:
+                    for interface in ("qm-br0", "qm-veth"):
+                        link = json.loads(run("ip", "-j", "link", "show", interface))[0]
+                        assert "UP" not in link["flags"], link
+                assert "qm_launch" not in run("nft", "list", "tables")
+                if attempt == "parent-crash":
+                    process.kill()
+                elif attempt == "job-crash":
+                    os.kill(int(pathlib.Path(f"{gates[0][0]}.pid").read_text()), signal.SIGKILL)
+                else:
+                    if attempt == "concurrent-cleanup":
+                        concurrent_cleanup = subprocess.Popen(
+                            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        # Cleanup cannot finish while the setup job is blocked.
+                        assert not select.select([concurrent_cleanup.stderr], [], [], 0.1)[0]
+                        assert concurrent_cleanup.poll() is None
+                    os.write(gates[0][1], b"1")
+                if attempt == "parallel-boot":
+                    # Interface and firewall setup must use the same job PID.
+                    nft_gate, nft_fd = gates[1]
+                    nft_pid_file = pathlib.Path(f"{nft_gate}.pid")
+                    wait_until(lambda: nft_pid_file.exists() and nft_pid_file.read_text().strip())
+                    assert int(nft_pid_file.read_text()) == worker_pid
+                    for interface in ("qm-br0", "qm-veth"):
+                        link = json.loads(run("ip", "-j", "link", "show", interface))[0]
+                        assert "UP" not in link["flags"], link
+                    assert "qm_launch" not in run("nft", "list", "tables")
+                    os.write(nft_fd, b"1")
+                    def network_up():
+                        result = subprocess.run(["ip", "-j", "link", "show", "qm-veth"],
+                                                text=True, capture_output=True)
+                        return result.returncode == 0 and "UP" in json.loads(result.stdout)[0]["flags"]
+                    wait_until(network_up)
+                    run("ping", "-c", "1", "-W", "2", "10.90.0.2")
+                    os.kill(process.pid, signal.SIGRTMIN + 3)
+                stdout, stderr = process.communicate(timeout=5)
+                if attempt == "parallel-boot":
+                    assert process.returncode == 0, (stdout, stderr)
+                    assert "Network setup complete" in stderr, stderr
+                else:
+                    assert process.returncode != 0, (stdout, stderr)
+                if attempt in ("async-host-failure", "async-nft-failure", "job-crash"):
+                    assert "QM network setup failed" in stderr, stderr
+                for fd in worker_fds:
+                    assert select.select([fd], [], [], 5)[0], "Setup worker survived startup"
+            if concurrent_cleanup is not None:
+                stdout, stderr = concurrent_cleanup.communicate(timeout=5)
+                assert concurrent_cleanup.returncode == 0, (stdout, stderr)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            if concurrent_cleanup is not None and concurrent_cleanup.poll() is None:
+                concurrent_cleanup.kill()
+                concurrent_cleanup.wait(timeout=5)
+            for gate, fd in gates:
+                os.close(fd)
+            for fd in worker_fds:
+                os.close(fd)
+            if attempt == "async-host-failure":
+                run("umount", target)
+            config["process"]["args"] = ["/init"]
+            base.write_text(json.dumps(config))
+            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        assert_network_removed(runtime)
+    print("Container boots during network setup; job failures, crashes and concurrent cleanup passed", flush=True)
 
     # Exercise the backend with names, subnet, MAC, MTU and sysctls different from QM.
     custom = directory / "custom-network"

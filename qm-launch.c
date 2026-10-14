@@ -21,9 +21,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -186,13 +189,21 @@ static int remove_runtime_path(const char *path, bool directory)
 static int cleanup(const char *runtime_dir, bool verbose)
 {
 	autofree char *state_file = join_path(runtime_dir, QM_STATE_FILE);
-	if (access(state_file, F_OK) < 0) {
+	autoclose int state_fd = open(state_file, O_RDONLY | O_CLOEXEC);
+	if (state_fd < 0) {
 		if (errno == ENOENT) {
 			log_verbose(verbose, "No saved cleanup state at %s",
 				    state_file);
 			return remove_runtime_path(runtime_dir, true);
 		}
-		warn("access %s", state_file);
+		warn("open %s", state_file);
+		return 1;
+	}
+	/* Setup workers inherit a shared lock. Wait for all of them, including
+	 * children of an interrupted worker, before tearing down resources.
+	 */
+	if (TEMP_FAILURE_RETRY(flock(state_fd, LOCK_EX)) < 0) {
+		warn("lock cleanup state %s", state_file);
 		return 1;
 	}
 	log_verbose(verbose, "Loading cleanup state from %s", state_file);
@@ -218,7 +229,70 @@ static int cleanup(const char *runtime_dir, bool verbose)
 	return result != 0;
 }
 
-static int setup(const Options *options, json_object *config, bool *state_created)
+static pid_t start_network(const Options *options, const NetworkOptions *network,
+			   const NetworkState *state)
+{
+	pid_t parent = getpid();
+	autoclose int parent_fd = syscall(SYS_pidfd_open, parent, 0);
+	if (parent_fd < 0) {
+		warn("open network parent pidfd");
+		return -1;
+	}
+	pid_t monitor = fork();
+	if (monitor < 0) {
+		warn("fork network monitor");
+		return -1;
+	}
+	if (monitor)
+		return monitor;
+
+	int status = 1;
+	if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+		warn("set network monitor parent-death signal");
+		goto failed;
+	}
+	if (getppid() != parent)
+		_exit(0);
+	/* Supervise a separate job so crashes and fatal errors in setup are
+	 * reported too. Crun ignores exit statuses from unrelated children.
+	 */
+	pid_t job_parent = getpid();
+	pid_t job = fork();
+	if (job < 0) {
+		warn("fork network setup");
+		goto failed;
+	}
+	if (!job) {
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+			warn("set network setup parent-death signal");
+			_exit(1);
+		}
+		if (getppid() != job_parent)
+			_exit(0);
+		int result = network_setup(network, state);
+		if (!result)
+			log_verbose(options->verbose, "Network setup complete");
+		_exit(result != 0);
+	}
+	status = wait_child(job);
+	if (!status)
+		_exit(0);
+	if (status < 0)
+		warn("wait for network setup");
+failed:
+	warnx("QM network setup failed (status %d); stopping container startup", status);
+	/* The parent may already be crun, which forwards catchable signals to
+	 * PID 1. SIGKILL ensures a failed job aborts startup even before crun
+	 * has created the container. The service's ExecStopPost cleans up.
+	 */
+	if (syscall(SYS_pidfd_send_signal, parent_fd, SIGKILL, NULL, 0) < 0 &&
+	    errno != ESRCH)
+		warn("stop container after network setup failure");
+	_exit(1);
+}
+
+static int setup(const Options *options, json_object *config, bool *state_created,
+		 pid_t *network_pid)
 {
 	log_verbose(options->verbose, "Preparing runtime directory %s",
 		    options->runtime_dir);
@@ -268,17 +342,21 @@ static int setup(const Options *options, json_object *config, bool *state_create
 	}
 
 	log_verbose(options->verbose,
-		    "Setting up network: bridge=%s veth=%s address=%s/%u "
+		    "Setting up network in background: bridge=%s veth=%s address=%s/%u "
 		    "gateway=%s nftables=%s",
 		    network.bridge, network.veth, network.ip, network.prefix_len,
 		    network.gateway, network.nft_table);
-	if (network_setup(&network, state->network)) {
-		warnx("QM network setup failed");
+	autofree char *state_file = join_path(options->runtime_dir, QM_STATE_FILE);
+	autoclose int state_fd = open(state_file, O_RDONLY | O_CLOEXEC);
+	if (state_fd < 0 || TEMP_FAILURE_RETRY(flock(state_fd, LOCK_SH)) < 0) {
+		warn("lock network setup state %s", state_file);
 		return 1;
 	}
-
-	log_verbose(options->verbose, "Network setup complete");
-	return 0;
+	/* Workers inherit the lock; setup closes the parent's copy before
+	 * execing crun. No worker PID needs to be persisted.
+	 */
+	*network_pid = start_network(options, &network, state->network);
+	return *network_pid < 0;
 }
 
 static int crun_run(const Options *options, json_object *config)
@@ -1184,10 +1262,18 @@ int main(int argc, char **argv)
 	}
 
 	bool state_created = false;
-	int status = setup(&options, config, &state_created);
+	pid_t network_pid = -1;
+	int status = setup(&options, config, &state_created, &network_pid);
 	if (!status)
 		status = crun_run(&options, config);
 
+	/* A successful launch execs crun. On a local failure, cancel the job
+	 * before cleanup waits for the shared lock held by its descendants.
+	 */
+	if (network_pid > 0) {
+		kill(network_pid, SIGKILL);
+		wait_child(network_pid);
+	}
 	if (state_created)
 		cleanup(options.runtime_dir, options.verbose);
 

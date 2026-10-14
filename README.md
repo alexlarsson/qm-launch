@@ -91,9 +91,18 @@ bridge `qm-br0` and host veth `qm-veth` through rtnetlink, with `eth0` inside
 QM. It uses subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
 `10.90.0.2`. The interfaces inherit the host's default IPv4 route MTU, falling
 back to 1500 when no default route exists.
+Once the namespace is pinned, the launcher starts network setup in the
+background and execs crun immediately. Container boot overlaps bridge, veth,
+address, route and firewall setup; `eth0` and connectivity become available
+when the job finishes. Crun remains the service's main process.
 
 Forwarding and masquerading rules live in a dedicated nftables table,
-`ip qm_launch`. Setup preserves unrelated tables and refuses existing QM
+`ip qm_launch`. The background network job configures the interfaces and
+installs the firewall rules in the same process. The host links stay down
+until setup finishes successfully. A temporary monitor aborts crun if network
+setup fails or crashes. Cleanup waits for setup workers using a lock on the saved
+state file, including after crun exits before setup finishes.
+Setup preserves unrelated tables and refuses existing QM
 interface or table names. Cleanup checks the recorded interface and table
 ownership. The fixed network supports one QM instance per host.
 Host IPv4 forwarding remains enabled after cleanup. The installed
@@ -126,6 +135,7 @@ shutdown. After ten seconds systemd kills any remaining service processes.
 tear down networking, and unpin the namespace, including after startup failure.
 The launcher also attempts cleanup if setup or exec fails. For manual runs,
 invoke `--cleanup` after crun exits, using the same `--runtime-dir` if overridden.
+This also applies when a background network failure terminates crun.
 Setup records teardown identities in `/run/qm/state.json` before creating
 namespaces, network interfaces or the container, and updates the file
 atomically. It records the crun executable,
@@ -168,7 +178,11 @@ applying SELinux labels.
 The optional live smoke test runs with temporary user, mount and network
 namespaces, plus a delegated transient user service. It exercises cgroup
 delegation, native networking, MTU selection, NAT traffic, foreground crun,
-graceful shutdown, failure rollback and crash recovery. It uses
+graceful shutdown, failure rollback and crash recovery. It also checks that
+interface and firewall setup use the same process and links stay down until
+the firewall is ready. It boots container
+PID 1 with network setup paused, checks that job failures and crashes abort
+startup, and checks cleanup waits for active setup workers. It uses
 a small test init and a separate systemd boot test using the host's `/usr`,
 without the QM rootfs or its SELinux policy. The systemd test checks both
 notifications from services inside the container and readiness forwarded to

@@ -19,8 +19,10 @@
 #include <net/if.h>
 #include <nftables/libnftables.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 
@@ -348,10 +350,17 @@ static int interface_sysctls(const NetworkOptions *options, const char *name)
 
 static int configure_namespace(const NetworkOptions *options, int netns)
 {
+	pid_t parent = getpid();
 	pid_t child = fork();
 	if (child < 0)
 		return -1;
 	if (!child) {
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0) {
+			warn("set network namespace parent-death signal");
+			_exit(1);
+		}
+		if (getppid() != parent)
+			_exit(1);
 		autortnl Rtnl nl = {0};
 		Link eth, lo;
 		int result = setns(netns, CLONE_NEWNET) < 0 ||
@@ -608,7 +617,6 @@ int network_setup(const NetworkOptions *options, const NetworkState *state)
 		warn("open rtnetlink");
 		return 1;
 	}
-	autonft struct nft_ctx *nft = nft_open();
 	uint32_t mtu;
 	if (default_mtu(&nl, options->fallback_mtu, &mtu) < 0) {
 		warn("find default route MTU");
@@ -639,7 +647,13 @@ int network_setup(const NetworkOptions *options, const NetworkState *state)
 		warn("set up QM network");
 		return 1;
 	}
-	if (configure_namespace(options, ns) || nft_setup(nft, options, owner))
+	if (configure_namespace(options, ns))
+		return 1;
+	/* All setup already runs in a background job. Install the firewall in
+	 * that same process, keeping the host links down until it is ready.
+	 */
+	autonft struct nft_ctx *nft = nft_open();
+	if (nft_setup(nft, options, owner))
 		return 1;
 	if (link_change(&nl, bridge.index, false) < 0 ||
 	    link_change(&nl, veth.index, false) < 0) {

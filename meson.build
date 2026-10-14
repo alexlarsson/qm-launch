@@ -30,6 +30,10 @@ install_data('90-qm-launch.conf',
 
 python = find_program('python3', required: false)
 if python.found()
+  executable('test-launch-network', launcher_sources + ['tests/network-nft.c'],
+    include_directories: include_directories('.'),
+    dependencies: launcher_deps,
+    link_args: ['-Wl,--wrap=nft_run_cmd_from_buffer', '-Wl,--wrap=mnl_socket_sendto'])
   executable('test-network', ['tests/network.c', 'qm-network.c', 'qm-utils.c', 'qm-state.c'],
     include_directories: include_directories('.'),
     dependencies: launcher_deps)
