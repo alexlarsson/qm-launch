@@ -744,6 +744,52 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert_network_removed(runtime)
     print("Loopback is ready before container boot; background setup, job failures, crashes and concurrent cleanup passed", flush=True)
 
+    process, runtime = launch("configured-network", settings={
+        "ip": "172.30.20.2", "gateway": "172.30.20.1", "prefix-length": 28,
+        "hostname": "qm-net-test"})
+    try:
+        assert select.select([process.stdout], [], [], 10)[0]
+        assert process.stdout.readline() == "READY\n"
+        def configured_network_up():
+            result = subprocess.run(["ip", "-j", "link", "show", "qm-veth"],
+                                    text=True, capture_output=True)
+            return result.returncode == 0 and "UP" in json.loads(result.stdout)[0]["flags"]
+        wait_until(configured_network_up)
+        gateway = json.loads(run("ip", "-j", "-4", "addr", "show", "qm-veth"))[0]
+        assert gateway["addr_info"][0]["local"] == "172.30.20.1"
+        assert gateway["addr_info"][0]["prefixlen"] == 28
+        routes = run("nsenter", f"--net={runtime / 'netns'}", "ip", "route")
+        assert "default via 172.30.20.1 dev eth0" in routes, routes
+        assert "172.30.20.0/28 dev eth0" in routes, routes
+        rules = run("nft", "list", "table", "ip", "qm_launch")
+        assert "172.30.20.0/28" in rules, rules
+        run("ping", "-c", "1", "-W", "2", "172.30.20.2")
+        assert_masquerading(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                            "/init", "--network-check")
+        contents = run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                       "/init", "--read-hosts")
+        assert "172.30.20.2\tqm-net-test qm\n" in contents
+        assert "172.30.20.1\thost.containers.internal host.docker.internal\n" in contents
+        filename = directory / "qmc-configured-network.conf"
+        configuration = json.loads(filename.read_text())
+        configuration.update({"ip": "10.90.0.2", "gateway": "10.90.0.1",
+                              "prefix-length": 24, "hostname": "next-qm"})
+        filename.write_text(json.dumps(configuration))
+        run(str(LAUNCHER), "update-resolv-conf", "--runtime-dir", str(runtime),
+            "--config", str(filename))
+        assert run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                   "/init", "--read-hosts") == contents
+        os.kill(process.pid, signal.SIGRTMIN + 3)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
+    assert_network_removed(runtime)
+    print("Configured network addresses, routes, NAT and startup hosts identity passed", flush=True)
+
     # Exercise the backend with names, subnet, MAC, MTU and sysctls different from QM.
     custom = directory / "custom-network"
     custom.mkdir(mode=0o700)

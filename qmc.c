@@ -34,8 +34,6 @@
 
 #define QM_CONTAINER_ID "qm"
 #define QM_SUBID_USER "qm_root"
-#define QM_IP "10.90.0.2"
-#define QM_GATEWAY "10.90.0.1"
 #define SUPERVISOR_CGROUP "supervisor"
 #define PAYLOAD_CGROUP "payload"
 
@@ -86,16 +84,16 @@ static size_t crun_prefix(char **argv, const char *executable, const char *root,
 	return index;
 }
 
-static NetworkOptions get_network_options(void)
+static NetworkOptions get_network_options(const Config *configuration)
 {
 	return (NetworkOptions){
 		.runtime_dir = opt_runtime_dir,
 		.veth = "qm-veth",
 		.interface = "eth0",
-		.ip = QM_IP,
-		.gateway = QM_GATEWAY,
-		.subnet = "10.90.0.0",
-		.prefix_len = 24,
+		.ip = configuration->ip,
+		.gateway = configuration->gateway,
+		.subnet = configuration->subnet,
+		.prefix_len = configuration->prefix_length,
 		.veth_mac = {0x02, 0x00, 0x0a, 0x5a, 0x00, 0x01},
 		.fallback_mtu = 1500,
 		.rp_filter = 2,
@@ -305,7 +303,7 @@ static int setup(const Config *configuration, json_object *config, bool *state_c
 		.netns = xstrdup(netns),
 	};
 	/* Check for conflicts before replacing an earlier cleanup journal. */
-	const NetworkOptions network = get_network_options();
+	const NetworkOptions network = get_network_options(configuration);
 	log_verbose(opt_verbose, "Checking network resource ownership");
 	state->network = network_prepare(&network);
 	if (!state->network) {
@@ -779,12 +777,13 @@ static void container_file(const char *base, const char *name, const char *conte
 	set_selinux_label(filename, context);
 }
 
-static char *hosts_contents(const char *hosts, const char *hostname)
+static char *hosts_contents(const char *hosts, const Config *configuration)
 {
+	const char *hostname = configuration->hostname;
 	bool add_container_alias = strcmp(hostname, QM_CONTAINER_ID) != 0;
 	return xasprintf("%s\n%s\thost.containers.internal "
 			 "host.docker.internal\n%s\t%s%s%s\n",
-			 hosts, QM_GATEWAY, QM_IP, hostname,
+			 hosts, configuration->gateway, configuration->ip, hostname,
 			 add_container_alias ? " " : "",
 			 add_container_alias ? QM_CONTAINER_ID : "");
 }
@@ -840,17 +839,18 @@ static int update_resolv_conf(const Config *configuration)
 		err(1, "read /etc/hosts");
 	}
 
-	/* Use the hostname saved at startup, including any configuration override.
+	/* Keep the running container's hostname and addresses even if the
+	 * administrator has edited the next launch's configuration.
 	 */
-	autofree char *hostname_file = join_path(opt_runtime_dir, "files/hostname");
-	autofree char *hostname = try_read_text_file(hostname_file);
-	if (!hostname) {
+	autofree char *hosts_config = join_path(opt_runtime_dir, "files/hosts.conf");
+	if (access(hosts_config, F_OK) < 0) {
 		if (errno == ENOENT)
 			return 0;
-		err(1, "read %s", hostname_file);
+		err(1, "access %s", hosts_config);
 	}
-	hostname[strcspn(hostname, "\r\n")] = '\0';
-	autofree char *contents = hosts_contents(hosts, hostname);
+	autofreeconfig Config *startup =
+		configuration_load(QM_DATA_DIR, QM_CONFIG_DIR, hosts_config);
+	autofree char *contents = hosts_contents(hosts, startup);
 	update_container_file("hosts", contents);
 	return 0;
 }
@@ -874,6 +874,14 @@ static void write_container_files(const Config *configuration, json_object *conf
 
 	autofree char *hostname = xasprintf("%s\n", configuration->hostname);
 	container_file(files, "hostname", hostname, context);
+	autofreejson json_object *hosts_config = js_new_object();
+	js_set_string(hosts_config, "hostname", configuration->hostname);
+	js_set_string(hosts_config, "ip", configuration->ip);
+	js_set_string(hosts_config, "gateway", configuration->gateway);
+	js_object_add(hosts_config, "prefix-length",
+		      js_new_int(configuration->prefix_length));
+	container_file(files, "hosts.conf", json_object_to_json_string(hosts_config),
+		       context);
 
 	autofree char *dns = try_read_text_file(configuration->resolv_conf);
 	if (!dns && errno != ENOENT)
@@ -883,7 +891,7 @@ static void write_container_files(const Config *configuration, json_object *conf
 		    dns ? "read" : "missing; wrote empty file");
 
 	autofree char *hosts = read_text_file("/etc/hosts");
-	autofree char *contents = hosts_contents(hosts, configuration->hostname);
+	autofree char *contents = hosts_contents(hosts, configuration);
 	container_file(files, "hosts", contents, context);
 }
 

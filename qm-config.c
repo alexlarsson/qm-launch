@@ -8,6 +8,7 @@
 #include "config.h"
 #include "qm-utils.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <err.h>
 #include <errno.h>
@@ -21,6 +22,8 @@ typedef enum {
 	CONFIG_STRING,
 	CONFIG_PATH,
 	CONFIG_HOSTNAME,
+	CONFIG_IPV4,
+	CONFIG_PREFIX_LENGTH,
 	CONFIG_USERNS,
 	CONFIG_BOOL,
 } ConfigValueType;
@@ -41,6 +44,9 @@ static const ConfigEntry config_entries[] = {
 	CONFIG_ENTRY("var-dir", var_dir, CONFIG_PATH),
 	CONFIG_ENTRY("seccomp", seccomp_file, CONFIG_PATH),
 	CONFIG_ENTRY("resolv-conf", resolv_conf, CONFIG_PATH),
+	CONFIG_ENTRY("ip", ip, CONFIG_IPV4),
+	CONFIG_ENTRY("gateway", gateway, CONFIG_IPV4),
+	CONFIG_ENTRY("prefix-length", prefix_length, CONFIG_PREFIX_LENGTH),
 	CONFIG_ENTRY("userns", userns, CONFIG_USERNS),
 	CONFIG_ENTRY("verbose", verbose, CONFIG_BOOL),
 };
@@ -53,7 +59,8 @@ static const char *const userns_names[] = {
 
 static bool string_type(ConfigValueType type)
 {
-	return type == CONFIG_STRING || type == CONFIG_PATH || type == CONFIG_HOSTNAME;
+	return type == CONFIG_STRING || type == CONFIG_PATH || type == CONFIG_HOSTNAME ||
+	       type == CONFIG_IPV4;
 }
 
 void config_free(Config *config)
@@ -72,12 +79,25 @@ static void parse_entry(Config *config, const ConfigEntry *entry, json_object *v
 			const char *filename)
 {
 	bool boolean = entry->type == CONFIG_BOOL;
-	if (!json_object_is_type(value, boolean ? json_type_boolean : json_type_string))
+	bool integer = entry->type == CONFIG_PREFIX_LENGTH;
+	enum json_type expected_type = json_type_string;
+	if (boolean)
+		expected_type = json_type_boolean;
+	else if (integer)
+		expected_type = json_type_int;
+	if (!json_object_is_type(value, expected_type))
 		errx(1, "%s: %s must be a JSON %s", filename, entry->name,
-		     boolean ? "boolean" : "string");
+		     json_type_to_name(expected_type));
 	void *field = (char *)config + entry->offset;
 	if (boolean) {
 		*(bool *)field = json_object_get_boolean(value);
+		return;
+	}
+	if (integer) {
+		int64_t prefix = json_object_get_int64(value);
+		if (prefix < 1 || prefix > 31)
+			errx(1, "%s: %s must be between 1 and 31", filename, entry->name);
+		*(unsigned int *)field = prefix;
 		return;
 	}
 
@@ -85,6 +105,16 @@ static void parse_entry(Config *config, const ConfigEntry *entry, json_object *v
 	if (strlen(string) != (size_t)json_object_get_string_len(value))
 		errx(1, "%s: %s contains a NUL byte", filename, entry->name);
 	switch (entry->type) {
+	case CONFIG_IPV4: {
+		struct in_addr address;
+		if (inet_pton(AF_INET, string, &address) != 1)
+			errx(1, "%s: %s must be an IPv4 address", filename, entry->name);
+		uint32_t ip = ntohl(address.s_addr);
+		if (!(ip >> 24) || (ip >> 24) == 127 || (ip >> 24) >= 224)
+			errx(1, "%s: %s must be a unicast IPv4 address", filename,
+			     entry->name);
+		break;
+	}
 	case CONFIG_PATH:
 		if (string[0] != '/')
 			errx(1, "%s: %s must be an absolute path: %s", filename,
@@ -108,12 +138,32 @@ static void parse_entry(Config *config, const ConfigEntry *entry, json_object *v
 	case CONFIG_STRING:
 		break;
 	case CONFIG_BOOL:
+	case CONFIG_PREFIX_LENGTH:
 		/* Handled above. */
 		abort();
 	}
 
 	free(*(char **)field);
 	*(char **)field = xstrdup(string);
+}
+
+static void validate_network(Config *config)
+{
+	struct in_addr address, gateway;
+	if (inet_pton(AF_INET, config->ip, &address) != 1 ||
+	    inet_pton(AF_INET, config->gateway, &gateway) != 1)
+		abort(); /* Individual values are validated while parsing. */
+	uint32_t ip = ntohl(address.s_addr), gw = ntohl(gateway.s_addr);
+	uint32_t mask = UINT32_MAX << (32 - config->prefix_length);
+	if (ip == gw || (ip & mask) != (gw & mask))
+		errx(1, "ip and gateway must be distinct addresses in the same subnet");
+	/* /31 has two usable endpoints. Shorter prefixes reserve both ends. */
+	if (config->prefix_length < 31 && (!(ip & ~mask) || (ip & ~mask) == ~mask ||
+					   !(gw & ~mask) || (gw & ~mask) == ~mask))
+		errx(1, "ip and gateway must not be network or broadcast addresses");
+	struct in_addr subnet = {.s_addr = htonl(ip & mask)};
+	if (!inet_ntop(AF_INET, &subnet, config->subnet, sizeof(config->subnet)))
+		err(1, "format network subnet");
 }
 
 static void merge_file(Config *config, const char *filename, bool optional)
@@ -194,6 +244,9 @@ Config *configuration_load(const char *vendor_dir, const char *admin_dir,
 	*config = (Config){
 		.base_config = xstrdup(QM_DATA_DIR "/qm.json"),
 		.hostname = xstrdup(DEFAULT_HOSTNAME),
+		.ip = xstrdup("10.90.0.2"),
+		.gateway = xstrdup("10.90.0.1"),
+		.prefix_length = 24,
 		.resolv_conf =
 			xstrdup(access("/run/systemd/resolve/resolv.conf", R_OK) == 0
 					? "/run/systemd/resolve/resolv.conf"
@@ -206,5 +259,6 @@ Config *configuration_load(const char *vendor_dir, const char *admin_dir,
 		merge_directory(config, vendor_dir);
 		merge_directory(config, admin_dir);
 	}
+	validate_network(config);
 	return steal_ptr(&config);
 }

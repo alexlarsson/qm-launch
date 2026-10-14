@@ -18,6 +18,10 @@ int main(int argc, char **argv)
 	autofreejson json_object *result = js_new_object();
 	js_set_string(result, "base-config", config->base_config);
 	js_set_string(result, "hostname", config->hostname);
+	js_set_string(result, "ip", config->ip);
+	js_set_string(result, "gateway", config->gateway);
+	js_object_add(result, "prefix-length", js_new_int(config->prefix_length));
+	js_set_string(result, "subnet", config->subnet);
 	if (config->rootfs)
 		js_set_string(result, "rootfs", config->rootfs);
 	if (config->etc_dir)

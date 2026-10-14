@@ -105,6 +105,22 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual([r["args"][0]["value"] for r in scheduling], [0, 3, 5])
         self.assertTrue(all("includes" not in r and "excludes" not in r for r in rules))
 
+    def test_configured_network_hosts_survive_configuration_changes(self):
+        settings = {"ip": "172.30.20.2", "gateway": "172.30.20.1", "prefix-length": 28}
+        result = self.prepare(hostname="qm-test", settings=settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.runtime / "files/hosts"
+        contents = target.read_text()
+        self.assertIn("172.30.20.1\thost.containers.internal host.docker.internal\n", contents)
+        self.assertIn("172.30.20.2\tqm-test qm\n", contents)
+        inode = target.stat().st_ino
+        # update_resolv uses a new configuration with default network settings.
+        target.write_text("stale contents\n")
+        result = self.update_resolv()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(target.read_text(), contents)
+        self.assertEqual(target.stat().st_ino, inode)
+
     def test_machine_id_validation(self):
         for value in ("", "0" * 32, "1" * 31, "1" * 33, "g" * 32):
             with self.subTest(machine_id=value):

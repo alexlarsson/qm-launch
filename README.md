@@ -23,7 +23,8 @@ so that this can install in parallel with the regular qm quadlet.
 The defaults use `qm` as hostname and OCI container ID and `/run/qm`
 for runtime files. When set, `RUNTIME_DIRECTORY` supplies the runtime path;
 systemd sets it from the service's `RuntimeDirectory` setting. `--runtime-dir`
-overrides that path. The launcher sets up a fixed QM network.
+overrides that path. The launcher sets up QM networking using the configured
+IPv4 addresses.
 Use `qmc launch` to start QM, `qmc exec` to run a command inside it,
 `qmc cleanup` to remove its runtime state, and `qmc update-resolv-conf` to
 refresh its DNS and hosts files. Options follow the subcommand.
@@ -58,6 +59,9 @@ Supported keys are:
 | --- | --- |
 | `base-config` | Absolute path to the OCI base JSON (default `/usr/share/qm/qm.json`) |
 | `hostname` | Container hostname (default `qm`) |
+| `ip` | Container IPv4 address (default `10.90.0.2`) |
+| `gateway` | Host veth IPv4 address (default `10.90.0.1`) |
+| `prefix-length` | JSON integer from 1 to 31 (default `24`) |
 | `rootfs` | Absolute path overriding the OCI root filesystem |
 | `etc-dir` | Absolute path overriding the `/etc` bind source |
 | `var-dir` | Absolute path overriding the `/var` bind source, with `/var/tmp` at its `tmp` subdirectory |
@@ -66,7 +70,19 @@ Supported keys are:
 | `userns` | `auto` (default), `off`, or `required` |
 | `verbose` | JSON boolean enabling launcher phase logging and crun debug output |
 
-Path and mode values are strings. Without path overrides, the OCI base
+Addresses, paths and mode values are strings. IP and gateway must be distinct
+usable addresses in the same subnet; the subnet is derived from `ip` and
+`prefix-length` after all configuration layers are loaded. For example:
+
+```json
+{
+  "ip": "172.30.20.2",
+  "gateway": "172.30.20.1",
+  "prefix-length": 28
+}
+```
+
+Without path overrides, the OCI base
 configuration supplies the root filesystem and bind sources. Without `seccomp`,
 the base configuration must contain an inline filter. The installed vendor file
 sets `rootfs` to `/usr/lib/qm/rootfs`, `etc-dir` to `/etc/qm`, `var-dir` to
@@ -140,8 +156,9 @@ The container retains its cgroup namespace and writable cgroup mount.
 The service's namespace is pinned at `/run/qm/netns`. The launcher creates
 a veth pair through rtnetlink, with `qm-veth` on the host and `eth0` inside
 QM. The gateway address is assigned directly to `qm-veth`; no bridge is needed.
-It uses subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
-`10.90.0.2`. The interfaces inherit the host's default IPv4 route MTU, falling
+The defaults use subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
+`10.90.0.2`; `qmc.conf` can override the addresses and prefix length.
+The interfaces inherit the host's default IPv4 route MTU, falling
 back to 1500 when no default route exists. The MTU is chosen once during setup.
 Host uplink configuration can finish later; QM uses the host's routes for
 outbound traffic without binding its NAT rules to a particular uplink address.
@@ -160,7 +177,7 @@ setup fails or crashes. Cleanup waits for setup workers using a lock on the save
 state file, including after crun exits before setup finishes.
 Setup preserves unrelated tables and refuses existing QM
 interface or table names. Cleanup checks the recorded interface and table
-ownership. The fixed network supports one QM instance per host.
+ownership. The fixed interface and table names support one QM instance per host.
 Host IPv4 forwarding remains enabled after cleanup. The installed
 `90-qm-launch.conf` sysctl drop-in preserves interface settings when udev
 runs systemd-sysctl. Missing interfaces are ignored during the early-boot pass;
@@ -179,7 +196,9 @@ the container, so a host loopback resolver is unsuitable.
 `/run/qm/files/resolv.conf` and `/run/qm/files/hosts` in place so the container's
 bind mounts see the new contents. Shorter contents are padded with spaces before
 truncation. The hosts file retains the generated gateway and container hostname
-entries, including a custom hostname set at startup. Missing source or runtime
+entries, using the hostname and addresses saved at startup in `files/hosts.conf`.
+Configuration changes to these values take effect on the next launch.
+Missing source or runtime
 files are left alone. The watcher stops with `qmc.service`.
 For manual runs, invoke `qmc update-resolv-conf` with the same `--runtime-dir`
 and `--config` override used at startup, if any.

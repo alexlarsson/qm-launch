@@ -1,6 +1,9 @@
 {
   "base-config": "@DATADIR@/qm.json",
   "hostname": "qm",
+  "ip": "10.90.0.2",
+  "gateway": "10.90.0.1",
+  "prefix-length": 24,
   "rootfs": "/usr/lib/qm/rootfs",
   "etc-dir": "/etc/qm",
   "var-dir": "/var/qm",

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <netinet/in.h>
 #include <stdbool.h>
 
 typedef enum { USERNS_AUTO, USERNS_OFF, USERNS_REQUIRED } UserNamespaceMode;
@@ -17,6 +18,10 @@ typedef struct {
 	char *var_dir;
 	char *seccomp_file;
 	char *resolv_conf;
+	char *ip;
+	char *gateway;
+	unsigned int prefix_length;
+	char subnet[INET_ADDRSTRLEN]; /* Derived from ip and prefix_length. */
 	UserNamespaceMode userns;
 	bool verbose;
 } Config;
