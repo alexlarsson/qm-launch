@@ -6,7 +6,7 @@
 Description=QM container
 # Start as soon as QM's prerequisites are ready, without waiting for basic.target.
 DefaultDependencies=no
-Wants=qm2-resolv-conf.path
+Wants=qmc-resolv-conf.path
 RequiresMountsFor=/usr/lib/qm/rootfs /etc/qm /var/qm
 # Writable host trees, static device nodes and the host sysctl pass must be ready.
 # The sysctl pass is ordered after systemd-modules-load.service.
@@ -18,7 +18,7 @@ Conflicts=shutdown.target
 Before=shutdown.target
 
 [Service]
-# Override service settings with a systemd drop-in for qm2.service.
+# Override service settings with a systemd drop-in for qmc.service.
 # See systemd.resource-control(5) for the resource controls below.
 # Crun forwards READY=1 from QM's systemd through the inherited NOTIFY_SOCKET.
 # The launcher aliases it in the runtime directory to avoid QM's own notify socket.

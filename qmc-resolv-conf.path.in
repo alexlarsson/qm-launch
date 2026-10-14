@@ -6,9 +6,9 @@
 Description=Watch QM host DNS and hosts configuration
 # Watch after QM is ready without making paths.target wait for container boot.
 DefaultDependencies=no
-BindsTo=qm2.service
-PartOf=qm2.service
-After=qm2.service
+BindsTo=qmc.service
+PartOf=qmc.service
+After=qmc.service
 Conflicts=shutdown.target
 Before=shutdown.target
 

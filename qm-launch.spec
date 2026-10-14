@@ -27,7 +27,7 @@ Requires:       systemd >= 254
 
 %description
 qmc prepares an OCI bundle and launches the QM container directly with
-crun, rtnetlink and nftables. It provides qm2.service alongside QM's existing
+crun, rtnetlink and nftables. It provides qmc.service alongside QM's existing
 service and supports running commands in the container with qmc exec.
 
 %prep
@@ -44,21 +44,21 @@ service and supports running commands in the container with qmc exec.
 %meson_test
 
 %post
-%systemd_post qm2.service qm2-resolv-conf.path qm2-resolv-conf.service
+%systemd_post qmc.service qmc-resolv-conf.path qmc-resolv-conf.service
 
 %preun
-%systemd_preun qm2.service qm2-resolv-conf.path qm2-resolv-conf.service
+%systemd_preun qmc.service qmc-resolv-conf.path qmc-resolv-conf.service
 
 %postun
-%systemd_postun qm2.service qm2-resolv-conf.path qm2-resolv-conf.service
+%systemd_postun qmc.service qmc-resolv-conf.path qmc-resolv-conf.service
 
 %files
 %license COPYING
 %doc README.md
 %{_bindir}/qmc
-%{_unitdir}/qm2.service
-%{_unitdir}/qm2-resolv-conf.path
-%{_unitdir}/qm2-resolv-conf.service
+%{_unitdir}/qmc.service
+%{_unitdir}/qmc-resolv-conf.path
+%{_unitdir}/qmc-resolv-conf.service
 %{_datadir}/qm/qm.json
 %{_prefix}/lib/sysctl.d/90-qm-launch.conf
 

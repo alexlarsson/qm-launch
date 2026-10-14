@@ -17,7 +17,7 @@ sudo meson install -C build
 sudo systemctl daemon-reload
 ```
 
-The installed `qm2.service` sits alongside the existing `qm.service`,
+The installed `qmc.service` sits alongside the existing `qm.service`,
 so that this can install in parallel with the regular qm quadlet.
 
 The defaults use `qm` as hostname and OCI container ID and `/run/qm`
@@ -35,9 +35,9 @@ qmc launch --hostname qm --seccomp seccomp-no-rt.json qm.json
 ```
 
 Pass `--verbose` to log configuration, cleanup, bundle and network setup phases
-to stderr and enable crun's `--debug` output. `qm2.service` enables this by
+to stderr and enable crun's `--debug` output. `qmc.service` enables this by
 default. Read the output with
-`journalctl -b -u qm2.service --no-pager`. For command debugging, use
+`journalctl -b -u qmc.service --no-pager`. For command debugging, use
 `qmc exec --verbose COMMAND`.
 
 The supplied OCI configuration enables a pseudo-terminal for QM's
@@ -49,7 +49,7 @@ It drains the console when the container exits and stops if crun dies.
 Custom configurations with `process.terminal=false` retain ordinary stdio.
 
 Run a command in the running container with `qmc exec`. For an interactive shell
-in the container started by `qm2.service`:
+in the container started by `qmc.service`:
 
 ```sh
 sudo qmc exec /bin/bash
@@ -79,11 +79,14 @@ config's inline seccomp filter is retained. The supplied `qm.json` contains
 only the static configuration and requires `--seccomp`; the service supplies
 it. Hostname, cgroup path, network namespace path, and generated mount sources
 are filled in by the launcher. The resulting OCI bundle is written as
-`/run/qm/config.json` when launched by `qm2.service`.
+`/run/qm/config.json` when launched by `qmc.service`.
 
-The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/machine-id`
-and `/etc/localtime` bind mounts. QM shares the host's machine ID; the localtime
-mount is omitted when its source is missing. Runtime setup replaces
+The launcher passes the host's `/etc/machine-id` to systemd through
+`--machine-id=`, overriding any existing container ID. Systemd manages the
+container's own machine-id file, including committing a transient ID when needed.
+Custom init commands retain their arguments.
+The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/localtime`
+bind mount, which is omitted when its source is missing. Runtime setup replaces
 Podman's generated mount sources and removes
 `container_uuid`. Systemd starts the launcher in
 the service's `supervisor` subgroup. The launcher strips that component from
@@ -123,18 +126,18 @@ available, otherwise `/etc/resolv.conf`. A missing resolver file produces an
 empty container resolver file. Nameservers must be reachable from
 the container, so a host loopback resolver is unsuitable.
 
-`qm2.service` starts `qm2-resolv-conf.path`, which watches `/etc/resolv.conf`,
+`qmc.service` starts `qmc-resolv-conf.path`, which watches `/etc/resolv.conf`,
 `/etc/hosts` and systemd-resolved's upstream file. Changes trigger
-`qm2-resolv-conf.service` to run `qmc update-resolv-conf`. It updates
+`qmc-resolv-conf.service` to run `qmc update-resolv-conf`. It updates
 `/run/qm/files/resolv.conf` and `/run/qm/files/hosts` in place so the container's
 bind mounts see the new contents. Shorter contents are padded with spaces before
 truncation. The hosts file retains the generated gateway and container hostname
 entries, including a custom hostname set at startup. Missing source or runtime
-files are left alone. The watcher stops with `qm2.service`.
+files are left alone. The watcher stops with `qmc.service`.
 For manual runs, invoke `qmc update-resolv-conf` with the same `--runtime-dir`
 and `--resolv-conf` overrides used at startup.
 
-`qm2.service` uses `DefaultDependencies=no` so it can start before `basic.target`.
+`qmc.service` uses `DefaultDependencies=no` so it can start before `basic.target`.
 It waits for the mounts backing `/usr/lib/qm/rootfs`, `/etc/qm` and `/var/qm`,
 host filesystem remounting, static device-node setup, tmpfiles setup (including
 `/var/qm/tmp`) and the host sysctl pass.
@@ -200,9 +203,9 @@ the firewall is ready. It boots container
 PID 1 with network setup paused, checks that job failures and crashes abort
 startup, and checks cleanup waits for active setup workers. It uses
 a small test init and a separate systemd boot test using the host's `/usr`,
-without the QM rootfs or its SELinux policy. The systemd test checks both
-notifications from services inside the container and readiness forwarded to
-the host. It uses
+without the QM rootfs or its SELinux policy. The systemd test checks
+notifications from services inside the container, readiness forwarded to
+the host, host machine-ID inheritance and committing an uninitialized ID. It uses
 `tests/seccomp-no-rt.json` and disables host subid detection for the live launch.
 Device and subid preparation tests use private `/dev` and `/etc` mounts:
 

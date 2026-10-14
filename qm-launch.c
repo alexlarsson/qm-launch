@@ -627,6 +627,30 @@ static void configure_identity(json_object *config, json_object *process,
 	js_set_string(config, "hostname", hostname);
 }
 
+static void configure_machine_id(json_object *process)
+{
+	json_object *args = js_need(process, "args", json_type_array);
+	const char *init = js_array_string(args, 0);
+	if (strcmp(init, "/sbin/init") && strcmp(init, "/usr/sbin/init") &&
+	    strcmp(init, "/lib/systemd/systemd") &&
+	    strcmp(init, "/usr/lib/systemd/systemd"))
+		return;
+
+	autofree char *id = read_text_file("/etc/machine-id");
+	id[strcspn(id, "\r\n")] = '\0';
+	if (strlen(id) != 32 ||
+	    strspn(id, "0123456789abcdefABCDEF") != 32 ||
+	    strspn(id, "0") == 32)
+		errx(1, "invalid host machine ID in /etc/machine-id");
+
+	/* Let systemd write or commit its own machine-id file. A host bind mount
+	 * would trigger machine-id-commit without being its expected tmpfs mount.
+	 * The last option overrides any machine ID supplied by the base config.
+	 */
+	autofree char *argument = xasprintf("--machine-id=%s", id);
+	js_array_add(args, js_new_string(argument));
+}
+
 static json_object *find_mount(json_object *config, const char *destination)
 {
 	json_object *mounts = js_need(config, "mounts", json_type_array);
@@ -884,6 +908,7 @@ static json_object *create_config(const Options *options)
 		    options->seccomp_file ? options->seccomp_file : "base config");
 	configure_seccomp(linux_config, process, options->seccomp_file);
 	configure_identity(config, process, options->hostname);
+	configure_machine_id(process);
 	configure_isolation(linux_config, options);
 	configure_userns(linux_config, options);
 	configure_annotations(config);

@@ -14,6 +14,7 @@ LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
 SOURCE = pathlib.Path(sys.argv[2]).resolve()
 EXPECTED_CGROUP = sys.argv[3] if len(sys.argv) > 3 else None
 PRIVATE_PATHS = os.environ.get("QM_TEST_PRIVATE_PATHS") == "1"
+HOST_MACHINE_ID = "d2c79cc3388a48e494c8cd22cce8f499"
 sys.argv = sys.argv[:1]
 
 
@@ -30,6 +31,7 @@ class PrepareTests(unittest.TestCase):
         self.hosts = pathlib.Path("/etc/hosts")
         if PRIVATE_PATHS:
             self.hosts.write_text("127.0.0.1\tlocalhost\n")
+            pathlib.Path("/etc/machine-id").write_text(HOST_MACHINE_ID + "\n")
             for name in ("subuid", "subgid"):
                 (self.subids / name).write_text("")
             for name in ("kvm", "fuse"):
@@ -65,6 +67,8 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(config["hostname"], "qm-test")
         self.assertIn("HOSTNAME=qm-test", config["process"]["env"])
         self.assertFalse(any(e.startswith("container_uuid=") for e in config["process"]["env"]))
+        self.assertEqual(config["process"]["args"],
+                         [*self.base["process"]["args"], "--machine-id=" + HOST_MACHINE_ID])
         self.assertEqual(config["root"], self.base["root"])
         self.assertEqual(config["process"]["capabilities"], self.base["process"]["capabilities"])
         self.assertEqual(config["linux"]["mountLabel"], self.base["linux"]["mountLabel"])
@@ -74,6 +78,7 @@ class PrepareTests(unittest.TestCase):
         netns = next(n for n in config["linux"]["namespaces"] if n["type"] == "network")
         self.assertEqual(netns["path"], str(self.runtime / "netns"))
         mounts = {m["destination"]: m for m in config["mounts"]}
+        self.assertNotIn("/etc/machine-id", mounts)
         self.assertEqual(mounts["/dev/shm"]["type"], "tmpfs")
         self.assertIn("size=65536k", mounts["/dev/shm"]["options"])
         for destination in ("/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/run/.containerenv", "/run/secrets"):
@@ -91,6 +96,28 @@ class PrepareTests(unittest.TestCase):
         scheduling = [r for r in rules if r["names"] == ["sched_setscheduler"]]
         self.assertEqual([r["args"][0]["value"] for r in scheduling], [0, 3, 5])
         self.assertTrue(all("includes" not in r and "excludes" not in r for r in rules))
+
+    def test_machine_id_validation(self):
+        for value in ("", "0" * 32, "1" * 31, "1" * 33, "g" * 32):
+            with self.subTest(machine_id=value):
+                if PRIVATE_PATHS:
+                    pathlib.Path("/etc/machine-id").write_text(value)
+                result = self.prepare(env={**os.environ, "QM_TEST_MACHINE_ID": value})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid host machine ID", result.stderr)
+
+    def test_custom_init_arguments(self):
+        self.base["process"]["args"] = ["/init", "--custom-argument"]
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.generated()["process"]["args"], self.base["process"]["args"])
+
+    def test_machine_id_overrides_base_argument(self):
+        self.base["process"]["args"] += ["--machine-id=" + "1" * 32]
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.generated()["process"]["args"][-1],
+                         "--machine-id=" + HOST_MACHINE_ID)
 
     def test_oci_seccomp_roundtrip(self):
         profile = {"defaultAction": "SCMP_ACT_ERRNO", "defaultErrnoRet": 38,

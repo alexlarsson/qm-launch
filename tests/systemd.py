@@ -16,6 +16,8 @@ import tempfile
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent
 LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
+MACHINE_ID_STATE = sys.argv[2] if len(sys.argv) > 2 else "existing"
+HOST_MACHINE_ID = pathlib.Path("/etc/machine-id").read_text().strip()
 
 subprocess.run(["mount", "--make-rprivate", "/"], check=True)
 subprocess.run(["mount", "-t", "tmpfs", "tmpfs", "/run"], check=True)
@@ -29,7 +31,12 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
         (root / name).symlink_to("usr/" + name)
     etc = root / "etc"
     etc.mkdir()
-    (etc / "machine-id").write_text("d2c79cc3388a48e494c8cd22cce8f499\n")
+    initial_id = "d2c79cc3388a48e494c8cd22cce8f499"
+    if initial_id == HOST_MACHINE_ID:
+        initial_id = "1" * 32
+    if MACHINE_ID_STATE == "uninitialized":
+        initial_id = "uninitialized"
+    (etc / "machine-id").write_text(initial_id + "\n")
     (etc / "os-release").write_text('ID=qm-test\nPRETTY_NAME="QM test"\n')
     units = etc / "systemd/system"
     units.mkdir(parents=True)
@@ -95,20 +102,34 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
                  "/usr/bin/cat", "/etc/machine-id"],
                 text=True, capture_output=True, timeout=5)
             assert result.returncode == 0, result
-            assert result.stdout == pathlib.Path("/etc/machine-id").read_text(), result
+            assert result.stdout.strip() == HOST_MACHINE_ID, result
+            result = subprocess.run(
+                [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                 "/usr/bin/systemctl", "start", "systemd-machine-id-commit.service"],
+                text=True, capture_output=True, timeout=10)
+            assert result.returncode == 0, result
+            result = subprocess.run(
+                [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                 "/usr/bin/systemctl", "show", "--property=Result", "--property=ConditionResult",
+                 "systemd-machine-id-commit.service"],
+                text=True, capture_output=True, timeout=5)
+            assert result.returncode == 0 and "Result=success\n" in result.stdout, result
+            condition = "yes" if MACHINE_ID_STATE == "uninitialized" else "no"
+            assert "ConditionResult=" + condition + "\n" in result.stdout, result
+            assert (etc / "machine-id").read_text().strip() == HOST_MACHINE_ID
             result = subprocess.run(
                 [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                  "/usr/bin/cat", "/proc/self/mountinfo"],
                 text=True, capture_output=True, timeout=5)
             assert result.returncode == 0, result
-            machine_id_mount = next(line.split() for line in result.stdout.splitlines()
-                                    if line.split()[4] == "/etc/machine-id")
-            assert "ro" in machine_id_mount[5].split(","), machine_id_mount
+            assert not any(line.split()[4] == "/etc/machine-id"
+                           for line in result.stdout.splitlines()), result
             os.kill(process.pid, signal.SIGRTMIN + 3)
             assert process.wait(timeout=10) == 0
             log.seek(0)
             assert "running in system mode" in log.read(), "missing early systemd console output"
-            print("Systemd PID 1 boots, accepts service notifications and forwards readiness through crun", flush=True)
+            print("Systemd PID 1 inherits the host machine ID, handles machine-id commit "
+                  f"({MACHINE_ID_STATE}), accepts service notifications and forwards readiness", flush=True)
         except BaseException:
             log.seek(0)
             print(log.read()[-8000:], file=sys.stderr)

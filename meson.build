@@ -18,7 +18,7 @@ launcher = executable('qmc', launcher_sources,
 service_config = configuration_data()
 service_config.set('BINDIR', get_option('prefix') / get_option('bindir'))
 service_config.set('DATADIR', data_dir)
-foreach unit : ['qm2.service', 'qm2-resolv-conf.path', 'qm2-resolv-conf.service']
+foreach unit : ['qmc.service', 'qmc-resolv-conf.path', 'qmc-resolv-conf.service']
   configure_file(input: unit + '.in', output: unit,
     configuration: service_config,
     install_dir: get_option('prefix') / 'lib/systemd/system')
@@ -38,12 +38,12 @@ if python.found()
     include_directories: include_directories('.'),
     dependencies: launcher_deps)
   prepare_launcher = executable('test-prepare',
-    launcher_sources + ['tests/prepare-cgroup.c', 'tests/file-truncate.c'],
+    launcher_sources + ['tests/prepare-cgroup.c', 'tests/prepare-machine-id.c', 'tests/file-truncate.c'],
     include_directories: include_directories('.'),
     dependencies: launcher_deps,
     # Keep LTO from inlining the call that the fixture wraps.
     c_args: ['-fno-lto'],
-    link_args: ['-fno-lto', '-Wl,--wrap=get_current_cgroup', '-Wl,--wrap=ftruncate64'])
+    link_args: ['-fno-lto', '-Wl,--wrap=get_current_cgroup', '-Wl,--wrap=read_text_file', '-Wl,--wrap=ftruncate64'])
   test('prepare', python, args: [files('tests/prepare.py'), prepare_launcher,
     meson.current_source_dir(), '/payload'])
   test('exec', python, args: [files('tests/exec.py'), launcher])

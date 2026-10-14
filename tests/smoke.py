@@ -786,4 +786,6 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     assert (runtime / "netns").exists(), "must preserve a namespace file we did not create"
     print("Namespace creation failure preserves the existing file", flush=True)
 
-subprocess.run([sys.executable, str(SOURCE / "tests/systemd.py"), str(LAUNCHER)], check=True)
+for machine_id_state in ("existing", "uninitialized"):
+    subprocess.run([sys.executable, str(SOURCE / "tests/systemd.py"), str(LAUNCHER),
+                    machine_id_state], check=True)

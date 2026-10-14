@@ -317,19 +317,6 @@
       ]
     },
     {
-      "destination": "/etc/machine-id",
-      "type": "bind",
-      "source": "/etc/machine-id",
-      "options": [
-        "bind",
-        "rprivate",
-        "ro",
-        "nosuid",
-        "noexec",
-        "nodev"
-      ]
-    },
-    {
       "destination": "/etc/hostname",
       "type": "bind",
       "options": [

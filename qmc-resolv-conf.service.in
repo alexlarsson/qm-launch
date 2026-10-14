@@ -6,15 +6,15 @@
 Description=Update QM DNS and hosts configuration
 # Allow updates while the host is still starting its basic services.
 DefaultDependencies=no
-Requisite=qm2.service
-PartOf=qm2.service
-After=qm2.service
+Requisite=qmc.service
+PartOf=qmc.service
+After=qmc.service
 Conflicts=shutdown.target
 Before=shutdown.target
 
 [Service]
 Type=oneshot
-# Reuse the directory without removing qm2.service's runtime files on exit.
+# Reuse the directory without removing qmc.service's runtime files on exit.
 RuntimeDirectory=qm
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
