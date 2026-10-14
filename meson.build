@@ -12,7 +12,7 @@ configure_file(output: 'config.h', configuration: build_config)
 
 launcher_sources = ['qm-launch.c', 'qm-utils.c', 'qm-network.c', 'qm-state.c', 'qm-console.c']
 launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables')]
-launcher = executable('qm-launch', launcher_sources,
+launcher = executable('qmc', launcher_sources,
   dependencies: launcher_deps, install: true)
 
 service_config = configuration_data()

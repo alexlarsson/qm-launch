@@ -1,4 +1,4 @@
-qm-launch is an experimental podman-less launcher for the qm
+qmc is an experimental podman-less launcher for the qm
 container, using crun directly. The intent is to be smaller and boot
 faster. Currently it is pretty hardcoded for the needs of qm, and is
 not flexible enough for any kind of generic use.
@@ -24,38 +24,41 @@ The defaults use `qm` as hostname and OCI container ID and `/run/qm`
 for runtime files. When set, `RUNTIME_DIRECTORY` supplies the runtime path;
 systemd sets it from the service's `RuntimeDirectory` setting. `--runtime-dir`
 overrides that path. The launcher sets up a fixed QM network.
-The base config is supplied as a positional argument.
+Use `qmc launch` to start QM, `qmc exec` to run a command inside it,
+`qmc cleanup` to remove its runtime state, and `qmc update-resolv-conf` to
+refresh its DNS and hosts files. Options follow the subcommand.
+For launch, the base config is supplied as a positional argument.
 For example, this may be the ExecStart option:
 
 ```sh
-qm-launch --hostname qm --seccomp seccomp-no-rt.json qm.json
+qmc launch --hostname qm --seccomp seccomp-no-rt.json qm.json
 ```
 
 Pass `--verbose` to log configuration, cleanup, bundle and network setup phases
 to stderr and enable crun's `--debug` output. `qm2.service` enables this by
 default. Read the output with
-`journalctl -b -u qm2.service --no-pager`. For command debugging, put
-`--verbose` before `--exec`.
+`journalctl -b -u qm2.service --no-pager`. For command debugging, use
+`qmc exec --verbose COMMAND`.
 
 The supplied OCI configuration enables a pseudo-terminal for QM's
 `/dev/console`. Crun hands its master descriptor to a launcher child, which
 copies console output to the launcher's stdout, captured by the service journal.
 This includes systemd's early startup output, using its normal logging settings.
-The relay provides output only; use `--exec` for an interactive shell.
+The relay provides output only; use `qmc exec` for an interactive shell.
 It drains the console when the container exits and stops if crun dies.
 Custom configurations with `process.terminal=false` retain ordinary stdio.
 
-Run a command in the running container with `--exec`. For an interactive shell
+Run a command in the running container with `qmc exec`. For an interactive shell
 in the container started by `qm2.service`:
 
 ```sh
-sudo qm-launch --exec /bin/bash
+sudo qmc exec /bin/bash
 ```
 
-All arguments after `--exec` belong to the command, including options:
+All arguments after the container command belong to it, including options:
 
 ```sh
-sudo qm-launch --exec /bin/bash -c 'systemctl status'
+sudo qmc exec /bin/bash -c 'systemctl status'
 ```
 
 User namespaces are automatic when both `/etc/subuid` and `/etc/subgid` contain
@@ -119,22 +122,22 @@ the container, so a host loopback resolver is unsuitable.
 
 `qm2.service` starts `qm2-resolv-conf.path`, which watches `/etc/resolv.conf`,
 `/etc/hosts` and systemd-resolved's upstream file. Changes trigger
-`qm2-resolv-conf.service` to run `qm-launch --update-resolv-conf`. It updates
+`qm2-resolv-conf.service` to run `qmc update-resolv-conf`. It updates
 `/run/qm/files/resolv.conf` and `/run/qm/files/hosts` in place so the container's
 bind mounts see the new contents. Shorter contents are padded with spaces before
 truncation. The hosts file retains the generated gateway and container hostname
 entries, including a custom hostname set at startup. Missing source or runtime
 files are left alone. The watcher stops with `qm2.service`.
-For manual runs, invoke `--update-resolv-conf` with the same `--runtime-dir`
+For manual runs, invoke `qmc update-resolv-conf` with the same `--runtime-dir`
 and `--resolv-conf` overrides used at startup.
 
 The service uses `KillMode=mixed` and `KillSignal=SIGRTMIN+3`: systemd signals
 foreground crun, which forwards the signal to container PID 1 for orderly
 shutdown. After ten seconds systemd kills any remaining service processes.
-`ExecStopPost` calls `qm-launch --cleanup` to delete surviving crun state,
+`ExecStopPost` calls `qmc cleanup` to delete surviving crun state,
 tear down networking, and unpin the namespace, including after startup failure.
 The launcher also attempts cleanup if setup or exec fails. For manual runs,
-invoke `--cleanup` after crun exits, using the same `--runtime-dir` if overridden.
+invoke `qmc cleanup` after crun exits, using the same `--runtime-dir` if overridden.
 This also applies when a background network failure terminates crun.
 Setup records teardown identities in `/run/qm/state.json` before creating
 namespaces, network interfaces or the container, and updates the file
@@ -150,7 +153,7 @@ Normal startup retries cleanup before writing a new bundle, warns if cleanup
 is incomplete, and continues with setup. The service preserves the runtime
 directory across stops so the cleanup journal survives, and waits five seconds
 between restart attempts.
-Without saved state, cleanup leaves unrecorded resources alone. `--prepare-only`
+Without saved state, cleanup leaves unrecorded resources alone. `qmc launch --prepare-only`
 does not record ownership or perform cleanup, and refuses pending cleanup state.
 Use one launcher per runtime directory.
 Avoid systemd filesystem/network namespace sandbox options: cleanup must see
@@ -168,7 +171,7 @@ applies. This requires crun built with systemd support.
 Inspect the generated bundle without privileged setup:
 
 ```sh
-build/qm-launch --prepare-only --runtime-dir /tmp/qm-preview \
+build/qmc launch --prepare-only --runtime-dir /tmp/qm-preview \
     --hostname qm --seccomp seccomp-no-rt.json qm.json
 ```
 
@@ -194,5 +197,5 @@ Device and subid preparation tests use private `/dev` and `/etc` mounts:
 systemd-run --user --service-type=exec --pipe --wait --collect --same-dir \
     -p Delegate=yes -p DelegateSubgroup=supervisor \
     unshare --user --map-root-user --net --mount \
-    python3 tests/smoke.py build/qm-launch
+    python3 tests/smoke.py build/qmc
 ```

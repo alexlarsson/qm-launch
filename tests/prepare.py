@@ -46,7 +46,7 @@ class PrepareTests(unittest.TestCase):
         for name, value in inputs.items():
             (self.directory / name).write_text(json.dumps(value))
         return subprocess.run(
-            [str(LAUNCHER), "--prepare-only", "--runtime-dir", str(self.runtime),
+            [str(LAUNCHER), "launch", "--prepare-only", "--runtime-dir", str(self.runtime),
              "--userns", "auto" if PRIVATE_PATHS else "off",
              *([] if seccomp is False else ["--seccomp", str(self.directory / "seccomp.json")]),
              *([] if host_resolv else ["--resolv-conf", str(self.resolv)]),
@@ -185,7 +185,7 @@ class PrepareTests(unittest.TestCase):
 
     def update_resolv(self, *extra, env=None):
         return subprocess.run(
-            [str(LAUNCHER), "--update-resolv-conf", "--resolv-conf", str(self.resolv),
+            [str(LAUNCHER), "update-resolv-conf", "--resolv-conf", str(self.resolv),
              *extra], text=True, capture_output=True,
             env={**os.environ, "RUNTIME_DIRECTORY": str(self.runtime), **(env or {})})
 
@@ -245,13 +245,13 @@ class PrepareTests(unittest.TestCase):
         self.assertIn(f"read {self.resolv}", result.stderr)
         self.assertEqual((self.runtime / "files/resolv.conf").read_text(), contents)
 
-    def test_update_resolver_modes(self):
-        for extra in (("--cleanup",), ("--prepare-only",),
-                      ("--exec", "/bin/true"), (str(SOURCE / "qm.json"),)):
+    def test_update_resolver_arguments(self):
+        for extra in (("cleanup",), ("--prepare-only",),
+                      ("exec", "/bin/true"), (str(SOURCE / "qm.json"),)):
             with self.subTest(extra=extra):
                 result = self.update_resolv(*extra)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("--update-resolv-conf", result.stderr)
+                self.assertIn("update-resolv-conf", result.stderr)
 
     def test_update_hosts_in_place(self):
         snapshot = self.directory / "before-truncate"
@@ -347,7 +347,7 @@ class PrepareTests(unittest.TestCase):
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.generated()["annotations"],
-                         {"io.container.manager": "qm-launch"})
+                         {"io.container.manager": "qmc"})
 
     @unittest.skipUnless(PRIVATE_PATHS, "requires the smoke test's private /etc and /dev")
     def test_existing_device_mount(self):
@@ -454,14 +454,14 @@ class PrepareTests(unittest.TestCase):
                  "crun": {"executable": "/bin/false", "root": str(self.runtime / "crun"), "id": "qm"}}
         (self.runtime / "state.json").write_text(json.dumps(saved))
         result = subprocess.run(
-            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+            [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
             text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.runtime / "netns").exists())
         self.assertEqual(json.loads((self.runtime / "state.json").read_text()), saved)
         (state / "status").unlink()
         result = subprocess.run(
-            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+            [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.runtime / "state.json").exists())
@@ -472,7 +472,7 @@ class PrepareTests(unittest.TestCase):
         (self.runtime / "netns").touch()
         (self.runtime / "state.json").write_text(json.dumps(
             {"version": 1, "netns": str(self.runtime / "netns")}))
-        result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)])
+        result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)])
         self.assertEqual(result.returncode, 0)
         self.assertFalse((self.runtime / "netns").exists())
         self.assertFalse((self.runtime / "state.json").exists())
@@ -482,7 +482,7 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.runtime / "state.json").exists())
         (self.runtime / "netns").touch()
-        result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+        result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.runtime / "netns").exists())
@@ -510,7 +510,7 @@ class PrepareTests(unittest.TestCase):
         (self.runtime / "state.json").write_text(json.dumps({
             "version": 1, "netns": str(pin),
             "crun": {"executable": str(executable), "root": str(root), "id": "recorded-id"}}))
-        result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+        result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(arguments.read_text()),
@@ -533,7 +533,7 @@ class PrepareTests(unittest.TestCase):
         for contents in ("{", '{"version":2}', '{"version":1,"netns":false}', invalid_network):
             with self.subTest(contents=contents):
                 state.write_text(contents)
-                result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+                result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
                                         text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(state.read_text(), contents)
@@ -555,7 +555,7 @@ class PrepareTests(unittest.TestCase):
         state = self.runtime / "state.json"
         state.write_text(saved)
         missing_config = self.directory / "missing.json"
-        command = [str(LAUNCHER), "--runtime-dir", str(self.runtime), str(missing_config)]
+        command = [str(LAUNCHER), "launch", "--runtime-dir", str(self.runtime), str(missing_config)]
         result = subprocess.run(command, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cleanup incomplete; continuing startup", result.stderr)
@@ -576,7 +576,7 @@ class PrepareTests(unittest.TestCase):
         (self.runtime / "netns").touch()
         (self.runtime / "state.json").write_text(json.dumps({
             "version": 1, "bundle": str(self.runtime), "netns": str(self.runtime / "netns")}))
-        command = [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)]
+        command = [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)]
         for _ in range(2):
             result = subprocess.run(command, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -601,7 +601,7 @@ class PrepareTests(unittest.TestCase):
             "version": 1, "bundle": str(self.runtime),
             "crun": {"executable": "/bin/false", "root": str(crun), "id": "qm"}}))
         result = subprocess.run(
-            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+            [str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.runtime.exists())

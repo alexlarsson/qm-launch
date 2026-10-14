@@ -37,14 +37,14 @@ class ExecTests(unittest.TestCase):
             subprocess.run(["mount", "--bind", str(self.crun), "/usr/bin/crun"], check=True)
             self.addCleanup(subprocess.run, ["umount", "/usr/bin/crun"], check=True)
 
-    def command(self, *args):
-        return [str(LAUNCHER), "--runtime-dir", str(self.runtime), *args]
+    def command(self, command, *args):
+        return [str(LAUNCHER), command, "--runtime-dir", str(self.runtime), *args]
 
     @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
     def test_exec_arguments_stdio_and_status(self):
         arguments = ["/bin/bash", "-c", "printf '%s' \"$1\"", "--", "two words",
                      "--runtime-dir", "relative", "--help"]
-        result = subprocess.run(self.command("--exec", *arguments),
+        result = subprocess.run(self.command("exec", *arguments),
                                 input="piped input\n", text=True, capture_output=True)
         self.assertEqual(result.returncode, 23, result.stderr)
         output = json.loads(result.stdout)
@@ -61,7 +61,7 @@ class ExecTests(unittest.TestCase):
         master, slave = os.openpty()
         self.addCleanup(os.close, master)
         try:
-            result = subprocess.run(self.command("--exec", "/bin/bash"),
+            result = subprocess.run(self.command("exec", "/bin/bash"),
                                     stdin=slave, stdout=slave, stderr=subprocess.PIPE)
         finally:
             os.close(slave)
@@ -72,7 +72,7 @@ class ExecTests(unittest.TestCase):
 
     @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
     def test_exec_separator(self):
-        result = subprocess.run(self.command("--exec", "--", "/bin/true"),
+        result = subprocess.run(self.command("exec", "--", "/bin/true"),
                                 input="", text=True, capture_output=True)
         self.assertEqual(result.returncode, 23, result.stderr)
         self.assertEqual(json.loads(result.stdout)["argv"][-2:], ["qm", "/bin/true"])
@@ -83,23 +83,25 @@ class ExecTests(unittest.TestCase):
             {"version": 1, "netns": str(self.runtime / "netns")}))
         environment = {**os.environ, "RUNTIME_DIRECTORY": str(self.runtime)}
         result = subprocess.run(
-            [str(LAUNCHER), "--cleanup"], text=True, capture_output=True, env=environment)
+            [str(LAUNCHER), "cleanup"], text=True, capture_output=True, env=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.runtime / "netns").exists())
         (self.runtime / "netns").touch()
         (self.runtime / "state.json").write_text(json.dumps(
             {"version": 1, "netns": str(self.runtime / "netns")}))
-        result = subprocess.run(self.command("--cleanup"), text=True, capture_output=True,
+        result = subprocess.run(self.command("cleanup"), text=True, capture_output=True,
                                 env={**environment, "RUNTIME_DIRECTORY": "/wrong-runtime"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.runtime / "netns").exists())
 
-    def test_exec_missing_command_and_conflicting_modes(self):
+    def test_invalid_command_arguments(self):
         cases = [
-            (["--exec"], "--exec requires a command"),
-            (["--exec", "--"], "--exec requires a command"),
-            (["--cleanup", "--exec", "/bin/bash"], "--exec cannot be combined"),
-            (["--prepare-only", "--exec", "/bin/bash"], "--exec cannot be combined"),
+            (["exec"], "exec requires a command"),
+            (["exec", "--"], "exec requires a command"),
+            (["exec", "--prepare-only", "/bin/bash"], "--prepare-only is not supported by exec"),
+            (["cleanup", "exec", "/bin/bash"], "cleanup takes no positional arguments"),
+            (["cleanup", "--hostname", "qm"], "--hostname is not supported by cleanup"),
+            (["unknown"], "unknown command"),
         ]
         for arguments, message in cases:
             with self.subTest(arguments=arguments):
@@ -107,11 +109,24 @@ class ExecTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
 
+    def test_help_and_missing_command(self):
+        for command in ([], ["launch"], ["exec"], ["cleanup"], ["update-resolv-conf"]):
+            with self.subTest(command=command):
+                result = subprocess.run([str(LAUNCHER), *command, "--help"],
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("qmc launch", result.stdout)
+                self.assertIn("qmc exec", result.stdout)
+                self.assertIn("qmc cleanup", result.stdout)
+        result = subprocess.run([str(LAUNCHER)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Usage: qmc", result.stderr)
+
     @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
     def test_exec_missing_crun_preserves_state(self):
         self.crun.write_text("#!/missing-interpreter\n")
         result = subprocess.run(
-            self.command("--exec", "/bin/bash"),
+            self.command("exec", "/bin/bash"),
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 1)
         self.assertIn("exec /usr/bin/crun", result.stderr)

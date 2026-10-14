@@ -14,4 +14,4 @@ Type=oneshot
 RuntimeDirectory=qm
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
-ExecStart=@BINDIR@/qm-launch --update-resolv-conf
+ExecStart=@BINDIR@/qmc update-resolv-conf

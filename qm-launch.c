@@ -44,8 +44,15 @@
 #define CRUN_PREFIX_ARGS 4
 
 typedef enum { USERNS_AUTO, USERNS_OFF, USERNS_REQUIRED } UserNamespaceMode;
+typedef enum {
+	COMMAND_LAUNCH,
+	COMMAND_EXEC,
+	COMMAND_CLEANUP,
+	COMMAND_UPDATE_RESOLV_CONF,
+} Command;
 
 typedef struct {
+	Command command;
 	const char *base_config;
 	const char *hostname;
 	const char *rootfs;
@@ -60,8 +67,6 @@ typedef struct {
 
 	bool verbose;
 	bool prepare_only;
-	bool cleanup_only;
-	bool update_resolv_conf;
 	char **exec_argv; /* Borrowed from main's argv, NULL-terminated. */
 } Options;
 
@@ -75,7 +80,7 @@ static void log_verbose(bool enabled, const char *format, ...)
 	int saved_errno = errno;
 	va_list args;
 	va_start(args, format);
-	fputs("qm-launch: ", stderr);
+	fputs("qmc: ", stderr);
 	vfprintf(stderr, format, args);
 	fputc('\n', stderr);
 	va_end(args);
@@ -858,7 +863,7 @@ static void configure_annotations(json_object *config)
 		}
 	}
 
-	js_set_string(clean, "io.container.manager", "qm-launch");
+	js_set_string(clean, "io.container.manager", "qmc");
 	js_object_add(config, "annotations", steal_ptr(&clean));
 }
 
@@ -1034,37 +1039,35 @@ static void write_bundle(const Options *options, json_object *config)
 static void usage(FILE *output)
 {
 	fprintf(output,
-		"Usage: qm-launch [OPTIONS] BASE_CONFIG\n"
-		"       qm-launch --cleanup [--runtime-dir DIR]\n"
-		"       qm-launch --update-resolv-conf [--runtime-dir DIR] "
-		"[--resolv-conf FILE]\n"
-		"       qm-launch [OPTIONS] --exec [--] COMMAND [ARG...]\n\n"
+		"Usage: qmc launch [OPTIONS] BASE_CONFIG\n"
+		"       qmc exec [OPTIONS] [--] COMMAND [ARG...]\n"
+		"       qmc cleanup [OPTIONS]\n"
+		"       qmc update-resolv-conf [OPTIONS]\n\n"
+		"Commands:\n"
+		"  launch                Prepare and start the QM container\n"
+		"  exec                  Run a command in the running container\n"
+		"  cleanup               Delete container and tear down networking\n"
+		"  update-resolv-conf    Update DNS and hosts files in place\n\n"
+		"Common options (after the command):\n"
+		"  --runtime-dir DIR     Runtime files (default %s)\n"
+		"                        RUNTIME_DIRECTORY overrides the default\n"
+		"  --verbose             Log startup phases and enable crun debug logging\n"
+		"  --help                Show this help\n\n"
+		"Launch options:\n"
 		"  --hostname NAME       Container hostname (default %s)\n"
 		"  --rootfs DIR          Override root.path\n"
 		"  --etc-dir DIR         Override the /etc bind source\n"
 		"  --var-dir DIR         Override the /var and /var/tmp bind "
 		"sources\n"
 		"  --seccomp FILE        OCI or containers-style seccomp JSON\n"
-		"  --runtime-dir DIR     Runtime files (default %s)\n"
-		"                        RUNTIME_DIRECTORY overrides the "
-		"default\n"
-		"  --resolv-conf FILE    DNS configuration (default host "
-		"resolv.conf)\n"
 		"  --userns MODE         auto (default), off, or required; "
 		"auto uses "
 		"%s subids when present\n"
-		"  --verbose             Log startup phases and enable crun debug "
-		"logging\n"
 		"  --prepare-only        Write bundle without privileged "
 		"setup\n"
-		"  --cleanup             Delete container and tear down "
-		"networking\n"
-		"  --update-resolv-conf  Update the running container's DNS "
-		"and hosts files in place\n"
-		"  --exec COMMAND ...    Run a command in the running "
-		"container; "
-		"must be last option\n",
-		DEFAULT_HOSTNAME, DEFAULT_RUNTIME_DIR, QM_SUBID_USER);
+		"\nLaunch and update-resolv-conf options:\n"
+		"  --resolv-conf FILE    DNS configuration (default host resolv.conf)\n",
+		DEFAULT_RUNTIME_DIR, DEFAULT_HOSTNAME, QM_SUBID_USER);
 }
 
 static UserNamespaceMode parse_userns_mode(const char *mode)
@@ -1086,8 +1089,29 @@ static void require_absolute_path(const char *option, const char *path)
 
 static Options parse_options(int argc, char **argv)
 {
+	if (argc < 2) {
+		usage(stderr);
+		exit(2);
+	}
+	if (!strcmp(argv[1], "--help")) {
+		usage(stdout);
+		exit(0);
+	}
+	Command command;
+	if (!strcmp(argv[1], "launch"))
+		command = COMMAND_LAUNCH;
+	else if (!strcmp(argv[1], "exec"))
+		command = COMMAND_EXEC;
+	else if (!strcmp(argv[1], "cleanup"))
+		command = COMMAND_CLEANUP;
+	else if (!strcmp(argv[1], "update-resolv-conf"))
+		command = COMMAND_UPDATE_RESOLV_CONF;
+	else
+		errx(2, "unknown command: %s (see qmc --help)", argv[1]);
+
 	const char *runtime_dir = getenv("RUNTIME_DIRECTORY");
 	Options options = {
+		.command = command,
 		.hostname = DEFAULT_HOSTNAME,
 		.resolv_conf =
 			access("/run/systemd/resolve/resolv.conf", R_OK) == 0
@@ -1110,15 +1134,25 @@ static Options parse_options(int argc, char **argv)
 		{"userns", required_argument, NULL, 'u'},
 		{"verbose", no_argument, NULL, 'V'},
 		{"prepare-only", no_argument, NULL, 'p'},
-		{"cleanup", no_argument, NULL, 'C'},
-		{"update-resolv-conf", no_argument, NULL, 'U'},
-		{"exec", no_argument, NULL, 'X'},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0}};
 
-	int option;
-	while ((option = getopt_long(argc, argv, "", long_options, NULL)) !=
+	/* Options follow the subcommand. Stop at the first positional argument,
+	 * so options belonging to an exec command are forwarded unchanged.
+	 */
+	optind = 2;
+	int option, option_index;
+	while ((option = getopt_long(argc, argv, "+", long_options, &option_index)) !=
 	       -1) {
+		if (option == '?') {
+			usage(stderr);
+			exit(2);
+		}
+		if (command != COMMAND_LAUNCH && option != 'r' &&
+		    option != 'V' && option != 'h' &&
+		    !(command == COMMAND_UPDATE_RESOLV_CONF && option == 'R'))
+			errx(2, "--%s is not supported by %s",
+			      long_options[option_index].name, argv[1]);
 		switch (option) {
 		case 'H':
 			options.hostname = optarg;
@@ -1150,17 +1184,6 @@ static Options parse_options(int argc, char **argv)
 		case 'p':
 			options.prepare_only = true;
 			break;
-		case 'C':
-			options.cleanup_only = true;
-			break;
-		case 'U':
-			options.update_resolv_conf = true;
-			break;
-		case 'X':
-			if (optind < argc && !strcmp(argv[optind], "--"))
-				optind++;
-			options.exec_argv = argv + optind;
-			goto parsed;
 		case 'h':
 			usage(stdout);
 			exit(0);
@@ -1170,34 +1193,21 @@ static Options parse_options(int argc, char **argv)
 		}
 	}
 
-parsed:
 	require_absolute_path("--runtime-dir", options.runtime_dir);
 	require_absolute_path("--rootfs", options.rootfs);
 	require_absolute_path("--etc-dir", options.etc_dir);
 	require_absolute_path("--var-dir", options.var_dir);
 
-	if (options.exec_argv) {
-		if (options.cleanup_only || options.prepare_only ||
-		    options.update_resolv_conf)
-			errx(1, "--exec cannot be combined with --cleanup or "
-				"--prepare-only or --update-resolv-conf");
+	if (command == COMMAND_EXEC) {
+		options.exec_argv = argv + optind;
 		if (!options.exec_argv[0] || !*options.exec_argv[0])
-			errx(1, "--exec requires a command");
+			errx(2, "exec requires a command");
 		return options;
 	}
 
-	if (options.update_resolv_conf) {
-		if (options.cleanup_only || options.prepare_only)
-			errx(1, "--update-resolv-conf cannot be combined with "
-				"--cleanup or --prepare-only");
+	if (command == COMMAND_UPDATE_RESOLV_CONF || command == COMMAND_CLEANUP) {
 		if (optind != argc)
-			errx(1, "--update-resolv-conf takes no base config");
-		return options;
-	}
-
-	if (options.cleanup_only) {
-		if (options.prepare_only || optind != argc)
-			errx(1, "--cleanup takes no base config");
+			errx(2, "%s takes no positional arguments", argv[1]);
 		return options;
 	}
 
@@ -1223,12 +1233,12 @@ int main(int argc, char **argv)
 {
 	const Options options = parse_options(argc, argv);
 
-	if (options.exec_argv)
+	if (options.command == COMMAND_EXEC)
 		return exec_in_container(&options);
 
-	if (options.cleanup_only)
+	if (options.command == COMMAND_CLEANUP)
 		return cleanup(options.runtime_dir, options.verbose);
-	if (options.update_resolv_conf)
+	if (options.command == COMMAND_UPDATE_RESOLV_CONF)
 		return update_resolv_conf(&options);
 
 	if (!options.prepare_only) {
@@ -1243,13 +1253,13 @@ int main(int argc, char **argv)
 	autofree char *netns = join_path(options.runtime_dir, "netns");
 	if (ns_is_mounted(netns))
 		errx(1, "runtime namespace already exists; stop the service or "
-			"run --cleanup");
+			"run qmc cleanup");
 	if (options.prepare_only) {
 		autofree char *state_file =
 			join_path(options.runtime_dir, QM_STATE_FILE);
 		struct stat st;
 		if (lstat(state_file, &st) == 0)
-			errx(1, "cleanup state already exists; run --cleanup");
+			errx(1, "cleanup state already exists; run qmc cleanup");
 		if (errno != ENOENT)
 			err(1, "stat %s", state_file);
 	}

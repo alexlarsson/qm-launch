@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
         notify.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         notify.bind("/run/systemd/notify")
         process = subprocess.Popen(
-            [str(LAUNCHER), "--verbose", "--runtime-dir", str(runtime),
+            [str(LAUNCHER), "launch", "--verbose", "--runtime-dir", str(runtime),
              "--userns", "off", "--seccomp", str(SOURCE / "tests/seccomp-no-rt.json"), str(base)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
             env={**os.environ, "NOTIFY_SOCKET": "/run/systemd/notify"})
@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
             assert struct.unpack("3i", credentials)[0] == process.pid
             notify.close()  # Release crun's notification barrier.
             result = subprocess.run(
-                [str(LAUNCHER), "--runtime-dir", str(runtime), "--exec",
+                [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                  "/usr/bin/systemctl", "is-active", "qm-test-ready.service"],
                 text=True, capture_output=True, timeout=5)
             assert result.returncode == 0 and result.stdout == "active\n", result
@@ -102,5 +102,5 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
-            subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime)], check=True)
+            subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)], check=True)
         assert not runtime.exists()

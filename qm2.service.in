@@ -69,10 +69,10 @@ RuntimeDirectoryPreserve=yes
 #   The final factor of two leaves headroom for FFI workloads.
 # The seccomp profile comes from the installed QM package.
 # Log launcher startup phases and crun debug output by default.
-ExecStart=@BINDIR@/qm-launch --verbose --hostname qm --rootfs ${ROOTFS} --etc-dir ${RWETCFS} --var-dir ${RWVARFS} --seccomp /usr/share/qm/seccomp-no-rt.json @DATADIR@/qm.json
+ExecStart=@BINDIR@/qmc launch --verbose --hostname qm --rootfs ${ROOTFS} --etc-dir ${RWETCFS} --var-dir ${RWVARFS} --seccomp /usr/share/qm/seccomp-no-rt.json @DATADIR@/qm.json
 # Delete surviving crun state, tear down networking and unpin the namespace,
 # including when startup fails.
-ExecStopPost=@BINDIR@/qm-launch --verbose --cleanup
+ExecStopPost=@BINDIR@/qmc cleanup --verbose
 
 # Signal foreground crun, which forwards SIGRTMIN+3 to the container's systemd
 # for orderly shutdown. Kill remaining service processes after the timeout.

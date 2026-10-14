@@ -241,7 +241,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         if notify_socket is not None:
             environment["NOTIFY_SOCKET"] = str(notify_socket)
         process = subprocess.Popen(
-            [str(launcher),
+            [str(launcher), "launch",
              "--seccomp", str(SOURCE / "tests/seccomp-no-rt.json"),
              "--resolv-conf", str(resolv), "--userns", "off",
              *extra, str(base)],
@@ -303,20 +303,20 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         for contents in ("search example.test\nnameserver 192.0.2.53\n",
                          "nameserver 192.0.2.54\n"):
             resolv.write_text(contents)
-            run(str(LAUNCHER), "--runtime-dir", str(runtime), "--resolv-conf",
-                str(resolv), "--update-resolv-conf")
-            assert run(str(LAUNCHER), "--runtime-dir", str(runtime), "--exec",
+            run(str(LAUNCHER), "update-resolv-conf", "--runtime-dir", str(runtime),
+                "--resolv-conf", str(resolv))
+            assert run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                        "/init", "--read-resolv") == contents
         hosts_inode = (runtime / "files/hosts").stat().st_ino
         for contents in ("127.0.0.1\tlocalhost\n192.0.2.100\tnew-host\n",
                          "127.0.0.1\tlocalhost\n"):
             (etc / "hosts").write_text(contents)
-            run(str(LAUNCHER), "--runtime-dir", str(runtime), "--resolv-conf",
-                str(resolv), "--update-resolv-conf")
+            run(str(LAUNCHER), "update-resolv-conf", "--runtime-dir", str(runtime),
+                "--resolv-conf", str(resolv))
             expected = (contents + "\n10.90.0.1\thost.containers.internal host.docker.internal\n"
                         "10.90.0.2\tqm-test qm\n")
             assert (runtime / "files/hosts").stat().st_ino == hosts_inode
-            assert run(str(LAUNCHER), "--runtime-dir", str(runtime), "--exec",
+            assert run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                        "/init", "--read-hosts") == expected
         container_ip = "10.90.0.2"
         print(run("nsenter", f"--net={runtime / 'netns'}", "ip", "route"), flush=True)
@@ -332,10 +332,10 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         run("/usr/lib/systemd/systemd-sysctl", "--prefix=/net/ipv4/conf/qm-br0",
             str(SOURCE / "90-qm-launch.conf"))
         assert pathlib.Path("/proc/sys/net/ipv4/conf/qm-br0/rp_filter").read_text().strip() == "2"
-        assert_masquerading(str(LAUNCHER), "--runtime-dir", str(runtime),
-                            "--exec", "/init", "--network-check")
-        command = [str(LAUNCHER), "--runtime-dir", str(runtime),
-                   "--exec", "/init", "--exec-check", "argument with spaces"]
+        assert_masquerading(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                            "/init", "--network-check")
+        command = [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                   "/init", "--exec-check", "argument with spaces"]
         result = subprocess.run(command, text=True, capture_output=True, timeout=10)
         assert result.returncode == 23, (result.stdout, result.stderr)
         assert result.stdout == "EXEC argument with spaces tty=0\n", result.stdout
@@ -352,14 +352,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         stdout, stderr = process.communicate(timeout=10)
         print(stdout, end="")
         assert process.returncode == 0, stderr
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Cgroup delegation, native networking, MTU, NAT, exec, signal forwarding and cleanup passed", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
     # Crun must wait for payload readiness and forward it as the main process.
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
@@ -372,7 +372,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             assert process.stdout.readline() == "READY\n"
             assert (runtime / "notify.sock").readlink() == pathlib.Path("/run/systemd/notify")
             assert not select.select([notify], [], [], 0.1)[0], "premature readiness"
-            run(str(LAUNCHER), "--runtime-dir", str(runtime), "--exec", "/init", "--notify")
+            run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime), "/init", "--notify")
             notify.settimeout(5)
             message, ancillary, flags, address = notify.recvmsg(
                 256, socket.CMSG_SPACE(struct.calcsize("3i")))
@@ -385,14 +385,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             os.kill(process.pid, signal.SIGRTMIN + 3)
             stdout, stderr = process.communicate(timeout=10)
             assert process.returncode == 0, stderr
-            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+            run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
             assert_network_removed(runtime)
             print("Crun proxies payload readiness as the main process for NotifyAccess=main", flush=True)
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+            run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
             pathlib.Path("/run/systemd/notify").unlink()
 
     crun = "/usr/bin/crun"
@@ -405,14 +405,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 255, (stdout, stderr)
         assert stdout == "".join(f"Fatal init diagnostic {i}\n" for i in range(2048)), stdout
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Console diagnostics reach stdout, drain on exit and preserve exit 255", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
     # A runtime failure before sending the console must not orphan the relay.
     config["process"]["args"] = ["/missing-init"]
@@ -421,7 +421,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     stdout, stderr = process.communicate(timeout=10)
     assert process.returncode != 0, (stdout, stderr)
     assert "missing-init" in stderr, stderr
-    run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+    run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
     assert_network_removed(runtime)
     print("Crun startup failure stops the waiting console relay", flush=True)
 
@@ -436,14 +436,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         os.kill(process.pid, signal.SIGRTMIN + 3)
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Custom configurations without a terminal retain ordinary stdio", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
     config["process"]["terminal"] = True
     base.write_text(json.dumps(config))
 
@@ -477,7 +477,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert process.returncode == -signal.SIGKILL, (stdout, stderr)
         assert "set sysctl net/ipv4/ip_forward" in stderr, stderr
         assert "QM network setup failed" in stderr, stderr
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Partial network setup rolls back on sysctl failure", flush=True)
     finally:
@@ -496,7 +496,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             assert "already exists" in stderr, stderr
             assert not (runtime / "state.json").exists()
             assert not (runtime / "netns").exists()
-            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+            run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
             assert not runtime.exists()
             if kind == "interface":
                 run("ip", "link", "show", "qm-br0")
@@ -529,16 +529,16 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
         assert "cleanup incomplete; continuing startup" in stderr, stderr
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Cleanup errors warn while allowing a successful launch", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
-    # Restart after a crash without an intervening --cleanup call.
+    # Restart after a crash without an intervening cleanup call.
     process, runtime = launch("missed-cleanup")
     try:
         assert select.select([process.stdout], [], [], 10)[0]
@@ -554,14 +554,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         os.kill(process.pid, signal.SIGRTMIN + 3)
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Startup recovers a crashed container without prior cleanup", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
     # Recover a killed launcher even after the namespace pin was removed.
     process, runtime = launch("recovery")
@@ -573,7 +573,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         run("umount", str(runtime / "netns"))
         (runtime / "netns").unlink()
         run("ip", "link", "set", "qm-br0", "alias", "another owner")
-        result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime)],
+        result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)],
                                 text=True, capture_output=True)
         assert result.returncode == 1, result.stderr
         assert "another owner" in result.stderr
@@ -582,7 +582,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         run("ip", "link", "show", "qm-br0")
         # An empty alias represents interruption between creation and tagging.
         run("ip", "link", "set", "qm-br0", "alias", "")
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         process.communicate(timeout=5)
         process, runtime = launch("recovery")
@@ -591,14 +591,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         os.kill(process.pid, signal.SIGRTMIN + 3)
         stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == 0, stderr
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
         print("Crash recovery, ownership checks, cleanup retries and restart passed", flush=True)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
 
     # Stopping after preparation must leave only saved state and the namespace.
     helper = str(LAUNCHER.parent / "test-network")
@@ -610,7 +610,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     links = json.loads(run("ip", "-j", "link", "show"))
     assert not {"test-br0", "test-veth"}.intersection(link["ifname"] for link in links)
     assert "test_network" not in run("nft", "list", "tables")
-    run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(prepared))
+    run(str(LAUNCHER), "cleanup", "--runtime-dir", str(prepared))
     assert not (prepared / "state.json").exists()
     assert not (prepared / "netns").exists()
     print("Network preparation saves cleanup state without changing the network", flush=True)
@@ -674,7 +674,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                 else:
                     if attempt == "concurrent-cleanup":
                         concurrent_cleanup = subprocess.Popen(
-                            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime)],
+                            [str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                         # Cleanup cannot finish while the setup job is blocked.
                         assert not select.select([concurrent_cleanup.stderr], [], [], 0.1)[0]
@@ -726,7 +726,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                 run("umount", target)
             config["process"]["args"] = ["/init"]
             base.write_text(json.dumps(config))
-            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(runtime))
+            run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
     print("Container boots during network setup; job failures, crashes and concurrent cleanup passed", flush=True)
 
@@ -764,8 +764,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         cleanup_dir = directory / "custom-cleanup"
         cleanup_dir.mkdir(mode=0o700)
         (custom / "state.json").rename(cleanup_dir / "state.json")
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(cleanup_dir))
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(cleanup_dir))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(cleanup_dir))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(cleanup_dir))
         assert not (cleanup_dir / "state.json").exists()
         assert not (custom / "netns").exists()
         links = json.loads(run("ip", "-j", "link", "show"))
@@ -774,9 +774,9 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert "unrelated" in run("nft", "list", "tables")
         print("Non-default network options, NAT, fallback MTU and cleanup from saved state passed", flush=True)
     finally:
-        run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(custom))
+        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(custom))
         if (directory / "custom-cleanup").exists():
-            run(str(LAUNCHER), "--cleanup", "--runtime-dir", str(directory / "custom-cleanup"))
+            run(str(LAUNCHER), "cleanup", "--runtime-dir", str(directory / "custom-cleanup"))
         run("ip", "route", "add", "default", "via", "192.0.2.2")
 
     process, runtime = launch("namespace-create-failure", existing_netns=True)

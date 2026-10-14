@@ -585,7 +585,7 @@ NetworkState *network_prepare(const NetworkOptions *options)
 		return NULL;
 	}
 	if (bridge.index || veth.index) {
-		warnx("%s or %s already exists; run --cleanup for its owner",
+		warnx("%s or %s already exists; run qmc cleanup for its owner",
 		      options->bridge, options->veth);
 		return NULL;
 	}
@@ -594,7 +594,7 @@ NetworkState *network_prepare(const NetworkOptions *options)
 	if (table < 0)
 		return NULL;
 	if (table) {
-		warnx("nftables table %s already exists; run --cleanup for its "
+		warnx("nftables table %s already exists; run qmc cleanup for its "
 		      "owner",
 		      options->nft_table);
 		return NULL;
