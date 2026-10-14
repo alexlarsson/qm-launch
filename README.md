@@ -144,6 +144,9 @@ are filled in by the launcher. The resulting OCI bundle is written as
 The launcher passes the host's `/etc/machine-id` to systemd through
 `--machine-id=`, overriding any existing container ID. Systemd manages the
 container's own machine-id file, including committing a transient ID when needed.
+If the host file contains an invalid ID, including the first-boot value
+`uninitialized`, the launcher warns and leaves the init arguments unchanged so
+systemd can select the container's ID.
 Custom init commands retain their arguments.
 The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/localtime`
 bind mount, which is omitted when its source is missing. Runtime setup replaces

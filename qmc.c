@@ -480,8 +480,11 @@ static void configure_machine_id(json_object *process)
 	autofree char *id = read_text_file("/etc/machine-id");
 	id[strcspn(id, "\r\n")] = '\0';
 	if (strlen(id) != 32 || strspn(id, "0123456789abcdefABCDEF") != 32 ||
-	    strspn(id, "0") == 32)
-		errx(1, "invalid host machine ID in /etc/machine-id");
+	    strspn(id, "0") == 32) {
+		warnx("invalid host machine ID in /etc/machine-id; "
+		      "leaving container machine ID selection to systemd");
+		return;
+	}
 
 	/* Let systemd write or commit its own machine-id file. A host bind mount
 	 * would trigger machine-id-commit without being its expected tmpfs mount.

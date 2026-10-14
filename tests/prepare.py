@@ -121,14 +121,18 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(target.read_text(), contents)
         self.assertEqual(target.stat().st_ino, inode)
 
-    def test_machine_id_validation(self):
-        for value in ("", "0" * 32, "1" * 31, "1" * 33, "g" * 32):
-            with self.subTest(machine_id=value):
-                if PRIVATE_PATHS:
-                    pathlib.Path("/etc/machine-id").write_text(value)
-                result = self.prepare(env={**os.environ, "QM_TEST_MACHINE_ID": value})
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("invalid host machine ID", result.stderr)
+    def test_invalid_host_machine_id_preserves_init_arguments(self):
+        for extra in ([], ["--machine-id=" + "1" * 32]):
+            base = {**self.base, "process": {
+                **self.base["process"], "args": [*self.base["process"]["args"], *extra]}}
+            for value in ("", "uninitialized\n", "0" * 32, "1" * 31, "1" * 33, "g" * 32):
+                with self.subTest(machine_id=value, extra=extra):
+                    if PRIVATE_PATHS:
+                        pathlib.Path("/etc/machine-id").write_text(value)
+                    result = self.prepare(base=base, env={**os.environ, "QM_TEST_MACHINE_ID": value})
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("invalid host machine ID", result.stderr)
+                    self.assertEqual(self.generated()["process"]["args"], base["process"]["args"])
 
     def test_custom_init_arguments(self):
         self.base["process"]["args"] = ["/init", "--custom-argument"]
