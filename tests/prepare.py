@@ -82,13 +82,6 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual((self.runtime / "files/resolv.conf").read_text(), self.resolv.read_text())
         self.assertIn("10.90.0.2\tqm-test qm\n", (self.runtime / "files/hosts").read_text())
         self.assertNotIn("overlay-containers", json.dumps(config))
-        network = json.loads((self.runtime / "network.json").read_text())
-        self.assertEqual(network["container_hostname"], "qm-test")
-        self.assertEqual(network["networks"]["qm"]["static_ips"], ["10.90.0.2"])
-        bridge = network["network_info"]["qm"]
-        self.assertEqual(bridge["network_interface"], "qm-br0")
-        self.assertEqual(bridge["subnets"], [{"subnet": "10.90.0.0/24", "gateway": "10.90.0.1"}])
-        self.assertFalse(bridge["dns_enabled"])
         self.assertEqual(config["annotations"]["run.oci.mount_context_type"], "rootcontext")
         profile = config["linux"]["seccomp"]
         self.assertNotIn("archMap", profile)
@@ -427,7 +420,6 @@ class PrepareTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{option} must be an absolute path", result.stderr)
 
-    @unittest.skipUnless(PRIVATE_PATHS, "requires the smoke test's private mount namespace")
     def test_cleanup_after_delete_failure(self):
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -435,23 +427,172 @@ class PrepareTests(unittest.TestCase):
         state.mkdir()
         (state / "status").touch()
         (self.runtime / "netns").touch()
-        subprocess.run(["mount", "--bind", "/bin/false", "/usr/bin/crun"], check=True)
-        try:
-            result = subprocess.run(
-                [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
-                text=True, capture_output=True)
-        finally:
-            subprocess.run(["umount", "/usr/bin/crun"], check=True)
+        saved = {"version": 1, "netns": str(self.runtime / "netns"),
+                 "crun": {"executable": "/bin/false", "root": str(self.runtime / "crun"), "id": "qm"}}
+        (self.runtime / "state.json").write_text(json.dumps(saved))
+        result = subprocess.run(
+            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+            text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.runtime / "netns").exists())
+        self.assertEqual(json.loads((self.runtime / "state.json").read_text()), saved)
+        (state / "status").unlink()
+        result = subprocess.run(
+            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.runtime / "state.json").exists())
 
     def test_cleanup_without_namespace(self):
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
         (self.runtime / "netns").touch()
+        (self.runtime / "state.json").write_text(json.dumps(
+            {"version": 1, "netns": str(self.runtime / "netns")}))
         result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)])
         self.assertEqual(result.returncode, 0)
         self.assertFalse((self.runtime / "netns").exists())
+        self.assertFalse((self.runtime / "state.json").exists())
+
+    def test_cleanup_without_state_preserves_unrecorded_files(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.runtime / "state.json").exists())
+        (self.runtime / "netns").touch()
+        result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.runtime / "netns").exists())
+
+    def test_cleanup_uses_recorded_crun_and_namespace(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pin = self.directory / "recorded-pin"
+        pin.touch()
+        (self.runtime / "netns").touch()
+        root = self.directory / "recorded-crun-root"
+        status = root / "recorded-id/status"
+        status.parent.mkdir(parents=True)
+        status.touch()
+        default_status = self.runtime / "crun/qm/status"
+        default_status.parent.mkdir()
+        default_status.touch()
+        arguments = self.directory / "delete-arguments.json"
+        executable = self.directory / "recorded-crun"
+        executable.write_text(
+            f"#!{sys.executable}\nimport json, pathlib, sys\n"
+            f"pathlib.Path({str(arguments)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+            f"pathlib.Path({str(status)!r}).unlink()\n")
+        executable.chmod(0o755)
+        (self.runtime / "state.json").write_text(json.dumps({
+            "version": 1, "netns": str(pin),
+            "crun": {"executable": str(executable), "root": str(root), "id": "recorded-id"}}))
+        result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(arguments.read_text()),
+                         ["--root", str(root), "delete", "--force", "recorded-id"])
+        self.assertFalse(pin.exists())
+        self.assertFalse(status.exists())
+        self.assertFalse((self.runtime / "state.json").exists())
+        self.assertTrue(default_status.exists())
+        self.assertTrue((self.runtime / "netns").exists())
+
+    def test_invalid_cleanup_state_is_preserved(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pin = self.runtime / "netns"
+        pin.touch()
+        state = self.runtime / "state.json"
+        invalid_network = json.dumps({"version": 1, "netns": str(pin),
+                                      "network": {"owner": "qm-launch:/saved", "bridge": "a" * 16,
+                                                  "veth": "test-veth", "nft_table": "saved"}})
+        for contents in ("{", '{"version":2}', '{"version":1,"netns":false}', invalid_network):
+            with self.subTest(contents=contents):
+                state.write_text(contents)
+                result = subprocess.run([str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+                                        text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(state.read_text(), contents)
+                self.assertTrue(pin.exists())
+
+    @unittest.skipUnless(os.geteuid() == 0, "startup requires root")
+    def test_startup_warns_and_retries_partial_cleanup(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = (self.runtime / "config.json").read_bytes()
+        status = self.runtime / "crun/qm/status"
+        status.parent.mkdir()
+        status.touch()
+        pin = self.runtime / "netns"
+        pin.touch()
+        saved = json.dumps({"version": 1, "bundle": str(self.runtime), "netns": str(pin),
+                            "crun": {"executable": "/bin/false",
+                                     "root": str(self.runtime / "crun"), "id": "qm"}})
+        state = self.runtime / "state.json"
+        state.write_text(saved)
+        missing_config = self.directory / "missing.json"
+        command = [str(LAUNCHER), "--runtime-dir", str(self.runtime), str(missing_config)]
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cleanup incomplete; continuing startup", result.stderr)
+        self.assertIn(f"read {missing_config}", result.stderr)
+        self.assertEqual(state.read_text(), saved)
+        self.assertEqual((self.runtime / "config.json").read_bytes(), bundle)
+        self.assertFalse(pin.exists())
+        status.unlink()
+        result = subprocess.run(command, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"read {missing_config}", result.stderr)
+        self.assertFalse(state.exists())
+        self.assertFalse(self.runtime.exists())
+
+    def test_successful_cleanup_removes_generated_runtime(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.runtime / "netns").touch()
+        (self.runtime / "state.json").write_text(json.dumps({
+            "version": 1, "bundle": str(self.runtime), "netns": str(self.runtime / "netns")}))
+        command = [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)]
+        for _ in range(2):
+            result = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self.runtime.exists())
+
+    def test_cleanup_removes_bundle_without_following_symlinks(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.runtime / "extra-file").write_text("another runtime file\n")
+        target = self.directory / "symlink-target"
+        target.write_text("outside the bundle\n")
+        hostname = self.runtime / "files/hostname"
+        hostname.unlink()
+        hostname.symlink_to(target)
+        crun = self.runtime / "crun"
+        cache = crun / ".cache/seccomp"
+        cache.mkdir(parents=True)
+        (cache / "filter").write_text("cached filter\n")
+        (cache / "link").symlink_to(target)
+        (crun / ".empty-directory").mkdir(mode=0o555)
+        (self.runtime / "state.json").write_text(json.dumps({
+            "version": 1, "bundle": str(self.runtime),
+            "crun": {"executable": "/bin/false", "root": str(crun), "id": "qm"}}))
+        result = subprocess.run(
+            [str(LAUNCHER), "--cleanup", "--runtime-dir", str(self.runtime)],
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.runtime.exists())
+        self.assertEqual(target.read_text(), "outside the bundle\n")
+
+    def test_prepare_preserves_existing_cleanup_state(self):
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = '{"version":1}'
+        (self.runtime / "state.json").write_text(saved)
+        result = self.prepare()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cleanup state already exists", result.stderr)
+        self.assertEqual((self.runtime / "state.json").read_text(), saved)
 
 
 unittest.main()

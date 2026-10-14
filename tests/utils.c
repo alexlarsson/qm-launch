@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 static unsigned open_calls, read_calls, write_calls, wait_calls;
@@ -137,6 +138,33 @@ int main(void)
 	fail_fork = false;
 	status = run_command(argv);
 	assert(status == 0);
+
+	/* Interrupted/partial writes must publish a complete state, and the
+	 * initial publication must not replace another launch's saved state.
+	 */
+	write_calls = 0;
+	js_save_atomic(object, filename, false);
+	struct stat before, after;
+	assert(stat(filename, &before) == 0);
+	assert((before.st_mode & 0777) == 0600);
+	autofreejson json_object *replacement = js_new_object();
+	js_set_string(replacement, "message", "replacement state");
+	child = fork();
+	assert(child >= 0);
+	if (!child) {
+		js_save_atomic(replacement, filename, false);
+		_exit(0);
+	}
+	assert(wait_child(child) == 1);
+	autofreejson json_object *original = js_load(filename);
+	assert(json_object_equal(original, object));
+	write_calls = 0;
+	js_save_atomic(replacement, filename, true);
+	assert(stat(filename, &after) == 0);
+	assert(before.st_ino != after.st_ino);
+	autofreejson json_object *replaced = js_load(filename);
+	assert(json_object_equal(replaced, replacement));
+	assert(unlink(filename) == 0);
 
 	return 0;
 }

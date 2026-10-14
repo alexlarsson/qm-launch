@@ -3,7 +3,7 @@
 # See COPYING for the full license text.
 
 Name:           qm-launch
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Launch the QM container directly with crun
 
@@ -14,20 +14,21 @@ Source0:        %{name}-%{version}.tar.xz
 BuildRequires:  gcc
 BuildRequires:  meson
 BuildRequires:  pkgconfig(json-c)
+BuildRequires:  pkgconfig(libmnl)
+BuildRequires:  pkgconfig(libnftables)
 BuildRequires:  python3
 BuildRequires:  systemd-rpm-macros
 
 # QM supplies the seccomp profile, rootfs setup and SELinux policy.
 Requires:       qm
 Requires:       crun
-Requires:       netavark
 Requires:       systemd >= 254
 %{?systemd_requires}
 
 %description
 qm-launch prepares an OCI bundle and launches the QM container directly with
-crun and Netavark. It provides qm2.service alongside QM's existing service
-and supports running commands in the container with --exec.
+crun, rtnetlink and nftables. It provides qm2.service alongside QM's existing
+service and supports running commands in the container with --exec.
 
 %prep
 %autosetup -p1
@@ -59,6 +60,7 @@ and supports running commands in the container with --exec.
 %{_unitdir}/qm2-resolv-conf.path
 %{_unitdir}/qm2-resolv-conf.service
 %{_datadir}/qm/qm.json
+%{_prefix}/lib/sysctl.d/90-qm-launch.conf
 
 %changelog
 * Tue Oct 13 2026 Alexander Larsson <alexl@redhat.com> - 0.1.0-1

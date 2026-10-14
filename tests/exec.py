@@ -79,12 +79,16 @@ class ExecTests(unittest.TestCase):
 
     def test_runtime_directory_environment(self):
         (self.runtime / "crun/qm/status").unlink()
+        (self.runtime / "state.json").write_text(json.dumps(
+            {"version": 1, "netns": str(self.runtime / "netns")}))
         environment = {**os.environ, "RUNTIME_DIRECTORY": str(self.runtime)}
         result = subprocess.run(
             [str(LAUNCHER), "--cleanup"], text=True, capture_output=True, env=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.runtime / "netns").exists())
         (self.runtime / "netns").touch()
+        (self.runtime / "state.json").write_text(json.dumps(
+            {"version": 1, "netns": str(self.runtime / "netns")}))
         result = subprocess.run(self.command("--cleanup"), text=True, capture_output=True,
                                 env={**environment, "RUNTIME_DIRECTORY": "/wrong-runtime"})
         self.assertEqual(result.returncode, 0, result.stderr)

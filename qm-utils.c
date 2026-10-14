@@ -9,6 +9,7 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <linux/magic.h>
 #include <sched.h>
 #include <stdarg.h>
@@ -129,6 +130,20 @@ char *read_text_file(const char *filename)
 	return contents;
 }
 
+int sysctl_write(const char *key, const char *value, bool optional)
+{
+	autofree char *path = join_path("/proc/sys", key);
+	autoclose int fd = TEMP_FAILURE_RETRY(open(path, O_WRONLY | O_CLOEXEC));
+	if (fd < 0 && optional && errno == ENOENT)
+		return 0;
+	if (fd < 0 || TEMP_FAILURE_RETRY(write(fd, value, strlen(value))) !=
+			      (ssize_t)strlen(value)) {
+		warn("set sysctl %s", key);
+		return -1;
+	}
+	return 0;
+}
+
 static json_object *js_checked(json_object *value)
 {
 	if (!value)
@@ -247,6 +262,35 @@ void js_save(json_object *object, const char *filename)
 	write_text_file(filename, contents);
 }
 
+void js_save_atomic(json_object *object, const char *filename, bool replace)
+{
+	const char *contents =
+		json_object_to_json_string_ext(object, JSON_C_TO_STRING_PRETTY);
+	if (!contents)
+		oom();
+	autofree char *temporary = xasprintf("%s.XXXXXX", filename);
+	autoclose int fd = mkostemp(temporary, O_CLOEXEC);
+	if (fd < 0)
+		err(1, "create temporary file for %s", filename);
+	write_all(fd, contents, strlen(contents));
+	if (close(fd) < 0)
+		err(1, "close %s", temporary);
+	fd = -1;
+	/* link() publishes the initial state without replacing another launch's
+	 * state. Subsequent snapshots replace the old file with rename().
+	 */
+	int result = replace ? rename(temporary, filename)
+			     : link(temporary, filename);
+	if (result < 0) {
+		int saved_errno = errno;
+		unlink(temporary);
+		errno = saved_errno;
+		err(1, "publish %s", filename);
+	}
+	if (!replace && unlink(temporary) < 0)
+		err(1, "unlink %s", temporary);
+}
+
 bool js_contains(json_object *array, const char *value)
 {
 	if (!array)
@@ -297,6 +341,25 @@ void write_text_file(const char *name, const char *contents)
 		err(1, "open %s", name);
 
 	write_all(fd, contents, strlen(contents));
+}
+
+static int remove_tree_entry(const char *path, const struct stat *st, int type,
+			     struct FTW *ftw)
+{
+	(void)st;
+	(void)type;
+	(void)ftw;
+	return remove(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+int remove_tree(const char *path)
+{
+	if (nftw(path, remove_tree_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) < 0 &&
+	    errno != ENOENT) {
+		warn("remove %s", path);
+		return 1;
+	}
+	return 0;
 }
 
 void set_selinux_label(const char *name, const char *context)

@@ -6,6 +6,9 @@ not flexible enough for any kind of generic use.
 
 Build and install:
 
+Build dependencies are a C compiler, Meson, json-c, libmnl and libnftables
+development files. Runtime dependencies include crun and QM.
+
 ```sh
 meson setup build --prefix=/usr
 meson compile -C build
@@ -20,8 +23,8 @@ so that this can install in parallel with the regular qm quadlet.
 The defaults use `qm` as hostname and OCI container ID and `/run/qm`
 for runtime files. When set, `RUNTIME_DIRECTORY` supplies the runtime path;
 systemd sets it from the service's `RuntimeDirectory` setting. `--runtime-dir`
-overrides that path. The launcher generates its default network
-configuration. The base config is supplied as a positional argument.
+overrides that path. The launcher sets up a fixed QM network.
+The base config is supplied as a positional argument.
 For example, this may be the ExecStart option:
 
 ```sh
@@ -69,13 +72,21 @@ the service's `supervisor` subgroup. The launcher strips that component from
 its cgroup path, and crun creates the sibling `payload` cgroup.
 The container retains its cgroup namespace and writable cgroup mount.
 
-The service's namespace is pinned at `/run/qm/netns`. Netavark takes care of bridge,
-veth, addresses, routes, forwarding and NAT. The default configuration uses
-bridge `qm-br0`, subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
-`10.90.0.2`. The generated configuration is written to the runtime directory as
-`network.json` for Netavark's setup and teardown commands.
-The bridge provides connectivity while QM keeps one stable static IPv4 address.
-DNS proxying is disabled. `--resolv-conf`
+The service's namespace is pinned at `/run/qm/netns`. The launcher creates
+bridge `qm-br0` and host veth `qm-veth` through rtnetlink, with `eth0` inside
+QM. It uses subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
+`10.90.0.2`. The interfaces inherit the host's default IPv4 route MTU, falling
+back to 1500 when no default route exists.
+
+Forwarding and masquerading rules live in a dedicated nftables table,
+`ip qm_launch`. Setup preserves unrelated tables and refuses existing QM
+interface or table names. Cleanup checks the recorded interface and table
+ownership. The fixed network supports one QM instance per host.
+Host IPv4 forwarding remains enabled after cleanup. The installed
+`90-qm-launch.conf` sysctl drop-in preserves interface settings when udev
+runs systemd-sysctl; setup creates no files in `/run/sysctl.d`.
+
+IPv6 and DNS proxying are disabled. `--resolv-conf`
 selects a file to copy; the default uses systemd-resolved's upstream file when
 available, otherwise `/etc/resolv.conf`. A missing resolver file produces an
 empty container resolver file. Nameservers must be reachable from
@@ -99,6 +110,22 @@ shutdown. After ten seconds systemd kills any remaining service processes.
 tear down networking, and unpin the namespace, including after startup failure.
 The launcher also attempts cleanup if setup or exec fails. For manual runs,
 invoke `--cleanup` after crun exits, using the same `--runtime-dir` if overridden.
+Setup records teardown identities in `/run/qm/state.json` before creating
+namespaces, network interfaces or the container, and updates the file
+atomically. It records the crun executable,
+state directory and container ID, the bundle directory, the namespace pin path,
+and the network interface names, nftables table and owner. Cleanup uses only
+this recorded state; startup options and current network defaults are not
+needed. A failed
+cleanup retains the state for a retry. Successful cleanup removes the recorded
+bundle directory recursively, including crun caches and the state file.
+Missing resources count as already cleaned up.
+Normal startup retries cleanup before writing a new bundle, warns if cleanup
+is incomplete, and continues with setup. The service preserves the runtime
+directory across stops so the cleanup journal survives, and waits five seconds
+between restart attempts.
+Without saved state, cleanup leaves unrecorded resources alone. `--prepare-only`
+does not record ownership or perform cleanup, and refuses pending cleanup state.
 Use one launcher per runtime directory.
 Avoid systemd filesystem/network namespace sandbox options: cleanup must see
 the namespace mount created during startup. The service reports process
@@ -116,7 +143,8 @@ applying SELinux labels.
 
 The optional live smoke test runs with temporary user, mount and network
 namespaces, plus a delegated transient user service. It exercises cgroup
-delegation, Netavark, foreground crun, graceful shutdown and cleanup; it uses
+delegation, native networking, MTU selection, NAT traffic, foreground crun,
+graceful shutdown, failure rollback and crash recovery. It uses
 a small test init, rather than the QM rootfs or its SELinux policy. It uses
 `tests/seccomp-no-rt.json` and disables host subid detection for the live launch.
 Device and subid preparation tests use private `/dev` and `/etc` mounts:

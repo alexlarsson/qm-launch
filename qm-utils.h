@@ -45,6 +45,8 @@ void *xrealloc(void *ptr, size_t size) __attribute__((alloc_size(2)));
 char *xstrdup(const char *string) __attribute__((malloc));
 char *xasprintf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
+#define xnew(type) ((type *)xmalloc(sizeof(type)))
+
 bool starts_with(const char *string, const char *prefix);
 char *join_path(const char *a, const char *b);
 
@@ -54,6 +56,14 @@ char *try_read_text_file(const char *filename);
 void write_all(int fd, const char *data, size_t length);
 void ensure_private_directory(const char *name);
 void write_text_file(const char *name, const char *contents);
+/* Remove a tree without following symlinks or crossing filesystems.
+ * Missing paths succeed; return 1 and report other errors on stderr.
+ */
+int remove_tree(const char *path);
+/* Write a slash-separated key under /proc/sys; optional ignores missing keys.
+ * Return 0 on success, -1 on failure and report errors on stderr.
+ */
+int sysctl_write(const char *key, const char *value, bool optional);
 void set_selinux_label(const char *name, const char *context);
 
 typedef struct {
@@ -106,4 +116,8 @@ void js_set_string(json_object *object, const char *key, const char *value);
 
 json_object *js_load(const char *filename);
 void js_save(json_object *object, const char *filename);
+/* Publish a complete JSON file atomically; refuse an existing file unless
+ * replace is true. New files are private to the current user.
+ */
+void js_save_atomic(json_object *object, const char *filename, bool replace);
 bool js_contains(json_object *array, const char *value);

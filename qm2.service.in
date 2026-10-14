@@ -36,6 +36,7 @@ MemorySwapMax=0
 # Raise the OOM score of QM's processes, making them preferred kernel OOM victims.
 OOMScoreAdjust=500
 Restart=always
+RestartSec=5s
 SyslogIdentifier=%N
 
 # ROOTFS is the QM root filesystem. RWETCFS and RWVARFS provide the writable
@@ -49,6 +50,8 @@ PassEnvironment=TZ
 # Use a separate runtime directory so this service can sit alongside qm.service.
 RuntimeDirectory=qm
 RuntimeDirectoryMode=0700
+# Retain the cleanup journal if cleanup fails; startup retries it.
+RuntimeDirectoryPreserve=yes
 
 # Container policy is defined in qm.json:
 # - Grant the captured capability set, excluding CAP_SYS_BOOT and CAP_SYS_RESOURCE.
