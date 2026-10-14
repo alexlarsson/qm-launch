@@ -81,8 +81,9 @@ it. Hostname, cgroup path, network namespace path, and generated mount sources
 are filled in by the launcher. The resulting OCI bundle is written as
 `/run/qm/config.json` when launched by `qm2.service`.
 
-The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/localtime`
-bind mount, which is omitted when its source is missing. Runtime setup replaces
+The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/machine-id`
+and `/etc/localtime` bind mounts. QM shares the host's machine ID; the localtime
+mount is omitted when its source is missing. Runtime setup replaces
 Podman's generated mount sources and removes
 `container_uuid`. Systemd starts the launcher in
 the service's `supervisor` subgroup. The launcher strips that component from

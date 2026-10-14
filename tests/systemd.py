@@ -54,13 +54,14 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
     config["linux"].pop("sysctl")
     config["linux"]["resources"] = {"devices": []}
     config["mounts"] = [m for m in config["mounts"] if m["destination"] not in
-                        ("/etc", "/var", "/var/tmp", "/sys/fs/selinux")]
+                        ("/var", "/var/tmp", "/sys/fs/selinux")]
     config["mounts"] += [
         {"destination": "/usr", "source": "/usr", "type": "bind", "options": ["rbind", "ro"]},
-        {"destination": "/etc", "source": str(etc), "type": "bind", "options": ["rbind"]},
     ]
     for mount in config["mounts"]:
-        if mount.get("type") == "devpts":
+        if mount["destination"] == "/etc":
+            mount["source"] = str(etc)
+        elif mount.get("type") == "devpts":
             mount["options"] = ["gid=0" if o == "gid=5" else o for o in mount["options"]]
     base = directory / "base.json"
     base.write_text(json.dumps(config))
@@ -89,6 +90,20 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
                  "/usr/bin/systemctl", "is-active", "qm-test-ready.service"],
                 text=True, capture_output=True, timeout=5)
             assert result.returncode == 0 and result.stdout == "active\n", result
+            result = subprocess.run(
+                [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                 "/usr/bin/cat", "/etc/machine-id"],
+                text=True, capture_output=True, timeout=5)
+            assert result.returncode == 0, result
+            assert result.stdout == pathlib.Path("/etc/machine-id").read_text(), result
+            result = subprocess.run(
+                [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                 "/usr/bin/cat", "/proc/self/mountinfo"],
+                text=True, capture_output=True, timeout=5)
+            assert result.returncode == 0, result
+            machine_id_mount = next(line.split() for line in result.stdout.splitlines()
+                                    if line.split()[4] == "/etc/machine-id")
+            assert "ro" in machine_id_mount[5].split(","), machine_id_mount
             os.kill(process.pid, signal.SIGRTMIN + 3)
             assert process.wait(timeout=10) == 0
             log.seek(0)
