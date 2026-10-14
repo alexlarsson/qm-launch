@@ -27,16 +27,61 @@ overrides that path. The launcher sets up a fixed QM network.
 Use `qmc launch` to start QM, `qmc exec` to run a command inside it,
 `qmc cleanup` to remove its runtime state, and `qmc update-resolv-conf` to
 refresh its DNS and hosts files. Options follow the subcommand.
-For launch, the base config is supplied as a positional argument.
-For example, this may be the ExecStart option:
 
-```sh
-qmc launch --hostname qm --seccomp seccomp-no-rt.json qm.json
+Container settings come from JSON configuration files, loaded in this order:
+
+1. `/usr/share/qm/qmc.conf`
+2. `/usr/share/qm/qmc.conf.d/*.conf`, sorted by filename
+3. `/etc/qmc.conf`
+4. `/etc/qmc.conf.d/*.conf`, sorted by filename
+
+Missing main files and directories are allowed. Each file is a JSON object;
+later values override earlier values for the same key. Drop-ins with the same
+filename in both directories are both read. Sorting uses byte order, independent
+of the host locale. Files with other suffixes are ignored. Invalid JSON, unknown
+keys and incorrect value types cause an error identifying the file.
+
+The installed vendor configuration supplies QM's paths and enables verbose
+logging. To customize the hostname and disable debug logging, for example,
+create `/etc/qmc.conf.d/50-local.conf` containing:
+
+```json
+{
+  "hostname": "my-qm",
+  "verbose": false
+}
 ```
 
-Pass `--verbose` to log configuration, cleanup, bundle and network setup phases
-to stderr and enable crun's `--debug` output. `qmc.service` enables this by
-default. Read the output with
+Supported keys are:
+
+| Key | Value |
+| --- | --- |
+| `base-config` | Absolute path to the OCI base JSON (default `/usr/share/qm/qm.json`) |
+| `hostname` | Container hostname (default `qm`) |
+| `rootfs` | Absolute path overriding the OCI root filesystem |
+| `etc-dir` | Absolute path overriding the `/etc` bind source |
+| `var-dir` | Absolute path overriding the `/var` bind source, with `/var/tmp` at its `tmp` subdirectory |
+| `seccomp` | Absolute path to an OCI or containers-style seccomp JSON file |
+| `resolv-conf` | Absolute path to the host resolver file; otherwise select the available host resolver automatically |
+| `userns` | `auto` (default), `off`, or `required` |
+| `verbose` | JSON boolean enabling launcher phase logging and crun debug output |
+
+Path and mode values are strings. Without path overrides, the OCI base
+configuration supplies the root filesystem and bind sources. Without `seccomp`,
+the base configuration must contain an inline filter. The installed vendor file
+sets `rootfs` to `/usr/lib/qm/rootfs`, `etc-dir` to `/etc/qm`, `var-dir` to
+`/var/qm`, and `seccomp` to `/usr/share/qm/seccomp-no-rt.json`.
+
+`qmc.service` runs `qmc launch`; container settings no longer require editing
+its command line. `--config FILE` on `launch` or `update-resolv-conf` loads
+only that file instead of the standard layers. Launch no longer takes a positional
+OCI config argument. `--runtime-dir` and `--prepare-only` remain command-line
+options and are rejected as configuration keys. `--verbose` remains available
+to force debug logging for an individual command.
+
+Cleanup uses recorded runtime state and does not read these configuration files.
+Exec also works independently of launch configuration. Both accept `--runtime-dir`
+and `--verbose`. Read service output with
 `journalctl -b -u qmc.service --no-pager`. For command debugging, use
 `qmc exec --verbose COMMAND`.
 
@@ -66,18 +111,17 @@ a `qm_root` range, as produced by QM's `userns enable` helper at image build
 time. The launcher maps container ID zero to the start of each range and uses
 the recorded range size. With neither entry, it launches without a user
 namespace. A partial or invalid configuration fails before crun starts.
-`--userns off` disables detection; `--userns required` fails when no ranges
+`"userns": "off"` disables detection; `"userns": "required"` fails when no ranges
 exist. User namespace
 operation with the QM rootfs, bind mounts and SELinux policy still needs a
 live integration test.
 
-`--seccomp` accepts OCI JSON or the supplied containers-style profile. The
+The `seccomp` setting accepts OCI JSON or the supplied containers-style profile. The
 latter's `archMap` and `includes`/`excludes` conditions are resolved against
 the host architecture and the configured bounding capabilities. Conditions
-other than `arches` and `caps` are rejected. Without this option, the base
+other than `arches` and `caps` are rejected. Without this setting, the base
 config's inline seccomp filter is retained. The supplied `qm.json` contains
-only the static configuration and requires `--seccomp`; the service supplies
-it. Hostname, cgroup path, network namespace path, and generated mount sources
+only the static configuration; the vendor `qmc.conf` supplies the seccomp path. Hostname, cgroup path, network namespace path, and generated mount sources
 are filled in by the launcher. The resulting OCI bundle is written as
 `/run/qm/config.json` when launched by `qmc.service`.
 
@@ -120,7 +164,7 @@ runs systemd-sysctl. Missing interfaces are ignored during the early-boot pass;
 udev applies the settings when the interfaces appear. Setup creates no files
 in `/run/sysctl.d`.
 
-IPv6 and DNS proxying are disabled. `--resolv-conf`
+IPv6 and DNS proxying are disabled. The `resolv-conf` setting
 selects a file to copy; the default uses systemd-resolved's upstream file when
 available, otherwise `/etc/resolv.conf`. A missing resolver file produces an
 empty container resolver file. Nameservers must be reachable from
@@ -135,7 +179,7 @@ truncation. The hosts file retains the generated gateway and container hostname
 entries, including a custom hostname set at startup. Missing source or runtime
 files are left alone. The watcher stops with `qmc.service`.
 For manual runs, invoke `qmc update-resolv-conf` with the same `--runtime-dir`
-and `--resolv-conf` overrides used at startup.
+and `--config` override used at startup, if any.
 
 `qmc.service` uses `DefaultDependencies=no` so it can start before `basic.target`.
 It waits for the mounts backing `/usr/lib/qm/rootfs`, `/etc/qm` and `/var/qm`,
@@ -187,12 +231,12 @@ applies. This requires crun built with systemd support.
 Inspect the generated bundle without privileged setup:
 
 ```sh
-build/qmc launch --prepare-only --runtime-dir /tmp/qm-preview \
-    --hostname qm --seccomp seccomp-no-rt.json qm.json
+build/qmc launch --prepare-only --runtime-dir /tmp/qm-preview
 ```
 
-This writes the bundle and files, without changing namespaces or cgroups or
-applying SELinux labels.
+This uses the installed configuration. Add `--config /absolute/path/qmc.conf`
+to preview a standalone configuration. It writes the bundle and files, without
+changing namespaces or cgroups or applying SELinux labels.
 
 The optional live smoke test runs with temporary user, mount and network
 namespaces, plus a delegated transient user service. It exercises cgroup

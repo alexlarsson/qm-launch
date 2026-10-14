@@ -8,9 +8,10 @@ project('qm-launch', 'c', version: '0.1.1',
 data_dir = get_option('prefix') / get_option('datadir') / 'qm'
 build_config = configuration_data()
 build_config.set_quoted('QM_DATA_DIR', data_dir)
+build_config.set_quoted('QM_CONFIG_DIR', get_option('prefix') / get_option('sysconfdir'))
 configure_file(output: 'config.h', configuration: build_config)
 
-launcher_sources = ['qm-launch.c', 'qm-utils.c', 'qm-network.c', 'qm-state.c', 'qm-console.c']
+launcher_sources = ['qm-launch.c', 'qm-utils.c', 'qm-network.c', 'qm-state.c', 'qm-console.c', 'qm-config.c']
 launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables')]
 launcher = executable('qmc', launcher_sources,
   dependencies: launcher_deps, install: true)
@@ -23,6 +24,10 @@ foreach unit : ['qmc.service', 'qmc-resolv-conf.path', 'qmc-resolv-conf.service'
     configuration: service_config,
     install_dir: get_option('prefix') / 'lib/systemd/system')
 endforeach
+configure_file(input: 'qmc.conf.in', output: 'qmc.conf',
+  configuration: service_config, install_dir: data_dir)
+install_emptydir(data_dir / 'qmc.conf.d')
+install_emptydir(get_option('prefix') / get_option('sysconfdir') / 'qmc.conf.d')
 install_data('qm.json',
   install_dir: data_dir)
 install_data('90-qm-launch.conf',
@@ -30,6 +35,10 @@ install_data('90-qm-launch.conf',
 
 python = find_program('python3', required: false)
 if python.found()
+  config_test = executable('test-config', ['tests/config.c', 'qm-config.c', 'qm-utils.c'],
+    include_directories: include_directories('.'),
+    dependencies: dependency('json-c'))
+  test('config', python, args: [files('tests/config.py'), config_test, data_dir])
   executable('test-launch-network', launcher_sources + ['tests/network-nft.c'],
     include_directories: include_directories('.'),
     dependencies: launcher_deps,

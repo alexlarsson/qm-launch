@@ -72,6 +72,9 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
             mount["options"] = ["gid=0" if o == "gid=5" else o for o in mount["options"]]
     base = directory / "base.json"
     base.write_text(json.dumps(config))
+    filename = directory / "qmc.conf"
+    filename.write_text(json.dumps({"base-config": str(base), "userns": "off",
+                                  "seccomp": str(SOURCE / "tests/seccomp-no-rt.json")}))
     runtime = directory / "runtime"
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify, \
@@ -80,7 +83,7 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
         notify.bind("/run/systemd/notify")
         process = subprocess.Popen(
             [str(LAUNCHER), "launch", "--verbose", "--runtime-dir", str(runtime),
-             "--userns", "off", "--seccomp", str(SOURCE / "tests/seccomp-no-rt.json"), str(base)],
+             "--config", str(filename)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
             env={**os.environ, "NOTIFY_SOCKET": "/run/systemd/notify"})
         try:

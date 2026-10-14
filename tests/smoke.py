@@ -229,7 +229,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     pathlib.Path("/proc/sys/net/ipv4/ip_forward").write_text("1\n")
     pathlib.Path("/proc/sys/net/ipv4/conf/default/forwarding").write_text("0\n")
 
-    def launch(attempt, extra=(), existing_netns=False, notify_socket=None,
+    def launch(attempt, extra=(), settings=None, existing_netns=False, notify_socket=None,
                launcher=LAUNCHER, env=None):
         runtime = directory / f"runtime-{attempt}"
         if existing_netns:
@@ -240,11 +240,13 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         environment.update(env or {})
         if notify_socket is not None:
             environment["NOTIFY_SOCKET"] = str(notify_socket)
+        config = {"base-config": str(base), "userns": "off",
+                  "seccomp": str(SOURCE / "tests/seccomp-no-rt.json"),
+                  "resolv-conf": str(resolv), **(settings or {})}
+        filename = directory / f"qmc-{attempt}.conf"
+        filename.write_text(json.dumps(config))
         process = subprocess.Popen(
-            [str(launcher), "launch",
-             "--seccomp", str(SOURCE / "tests/seccomp-no-rt.json"),
-             "--resolv-conf", str(resolv), "--userns", "off",
-             *extra, str(base)],
+            [str(launcher), "launch", "--config", str(filename), *extra],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=environment,
         )
@@ -278,7 +280,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                 listener.kill()
                 listener.wait()
 
-    process, runtime = launch('normal with "quotes" and \\slashes', extra=("--hostname", "qm-test"))
+    process, runtime = launch('normal with "quotes" and \\slashes', settings={"hostname": "qm-test"})
     try:
         ready = False
         output = b""
@@ -304,7 +306,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                          "nameserver 192.0.2.54\n"):
             resolv.write_text(contents)
             run(str(LAUNCHER), "update-resolv-conf", "--runtime-dir", str(runtime),
-                "--resolv-conf", str(resolv))
+                "--config", str(directory / 'qmc-normal with "quotes" and \\slashes.conf'))
             assert run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                        "/init", "--read-resolv") == contents
         hosts_inode = (runtime / "files/hosts").stat().st_ino
@@ -312,7 +314,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                          "127.0.0.1\tlocalhost\n"):
             (etc / "hosts").write_text(contents)
             run(str(LAUNCHER), "update-resolv-conf", "--runtime-dir", str(runtime),
-                "--resolv-conf", str(resolv))
+                "--config", str(directory / 'qmc-normal with "quotes" and \\slashes.conf'))
             expected = (contents + "\n10.90.0.1\thost.containers.internal host.docker.internal\n"
                         "10.90.0.2\tqm-test qm\n")
             assert (runtime / "files/hosts").stat().st_ino == hosts_inode

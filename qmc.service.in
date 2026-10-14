@@ -52,11 +52,6 @@ Restart=always
 RestartSec=5s
 SyslogIdentifier=%N
 
-# ROOTFS is the QM root filesystem. RWETCFS and RWVARFS provide the writable
-# /etc and /var trees; /var/tmp uses ${RWVARFS}/tmp.
-Environment=ROOTFS=/usr/lib/qm/rootfs
-Environment=RWETCFS=/etc/qm
-Environment=RWVARFS=/var/qm
 # Forward an explicit TZ override. The base config also binds host /etc/localtime.
 PassEnvironment=TZ
 
@@ -77,9 +72,8 @@ RuntimeDirectoryPreserve=yes
 #   A sizing estimate is RLIMIT_MSGQUEUE / (msg_max * msgsize_max) / 2, where
 #   msg_max is the messages per queue and msgsize_max is the message size.
 #   The final factor of two leaves headroom for FFI workloads.
-# The seccomp profile comes from the installed QM package.
-# Log launcher startup phases and crun debug output by default.
-ExecStart=@BINDIR@/qmc launch --verbose --hostname qm --rootfs ${ROOTFS} --etc-dir ${RWETCFS} --var-dir ${RWVARFS} --seccomp /usr/share/qm/seccomp-no-rt.json @DATADIR@/qm.json
+# Container settings and default verbosity come from layered qmc.conf files.
+ExecStart=@BINDIR@/qmc launch
 # Delete surviving crun state, tear down networking and unpin the namespace,
 # including when startup fails.
 ExecStopPost=@BINDIR@/qmc cleanup --verbose

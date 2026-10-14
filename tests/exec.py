@@ -100,7 +100,7 @@ class ExecTests(unittest.TestCase):
             (["exec", "--"], "exec requires a command"),
             (["exec", "--prepare-only", "/bin/bash"], "--prepare-only is not supported by exec"),
             (["cleanup", "exec", "/bin/bash"], "cleanup takes no positional arguments"),
-            (["cleanup", "--hostname", "qm"], "--hostname is not supported by cleanup"),
+            (["cleanup", "--hostname", "qm"], "unrecognized option"),
             (["unknown"], "unknown command"),
         ]
         for arguments, message in cases:

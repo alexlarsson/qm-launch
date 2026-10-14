@@ -1,0 +1,10 @@
+{
+  "base-config": "@DATADIR@/qm.json",
+  "hostname": "qm",
+  "rootfs": "/usr/lib/qm/rootfs",
+  "etc-dir": "/etc/qm",
+  "var-dir": "/var/qm",
+  "seccomp": "/usr/share/qm/seccomp-no-rt.json",
+  "userns": "auto",
+  "verbose": true
+}

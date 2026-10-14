@@ -40,20 +40,28 @@ class PrepareTests(unittest.TestCase):
         self.seccomp = json.loads((SOURCE / "tests/seccomp-no-rt.json").read_text())
 
     def prepare(self, base=None, seccomp=None, hostname="qm", extra=(), env=None,
-                host_resolv=False):
+                host_resolv=False, settings=None):
         inputs = {
             "base.json": self.base if base is None else base,
             "seccomp.json": self.seccomp if seccomp is None else seccomp,
         }
         for name, value in inputs.items():
             (self.directory / name).write_text(json.dumps(value))
+        config = {
+            "base-config": str(self.directory / "base.json"),
+            "hostname": hostname,
+            "userns": "auto" if PRIVATE_PATHS else "off",
+        }
+        if seccomp is not False:
+            config["seccomp"] = str(self.directory / "seccomp.json")
+        if not host_resolv:
+            config["resolv-conf"] = str(self.resolv)
+        config.update(settings or {})
+        filename = self.directory / "qmc.conf"
+        filename.write_text(json.dumps(config))
         return subprocess.run(
             [str(LAUNCHER), "launch", "--prepare-only", "--runtime-dir", str(self.runtime),
-             "--userns", "auto" if PRIVATE_PATHS else "off",
-             *([] if seccomp is False else ["--seccomp", str(self.directory / "seccomp.json")]),
-             *([] if host_resolv else ["--resolv-conf", str(self.resolv)]),
-             "--hostname", hostname,
-             *extra, str(self.directory / "base.json")],
+             "--config", str(filename), *extra],
             text=True, capture_output=True, env=env,
         )
 
@@ -149,10 +157,32 @@ class PrepareTests(unittest.TestCase):
                          ["SYSTEMD_LOG_TARGET=journal"])
         self.assertIn("HOME=/root", env)
 
+    def test_configuration_verbosity_and_cli_override(self):
+        result = self.prepare(settings={"verbose": False})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Loading OCI configuration", result.stderr)
+        result = self.prepare(settings={"verbose": True})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Loading OCI configuration", result.stderr)
+        result = self.prepare(settings={"verbose": False}, extra=("--verbose",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Loading OCI configuration", result.stderr)
+
+    def test_removed_options_and_positional_config(self):
+        for option in ("--hostname", "--rootfs", "--etc-dir", "--var-dir",
+                       "--seccomp", "--resolv-conf", "--userns"):
+            with self.subTest(option=option):
+                result = self.prepare(extra=(option, "value"))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("unrecognized option", result.stderr)
+        result = self.prepare(extra=(str(self.directory / "base.json"),))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("launch takes no positional arguments", result.stderr)
+
     def test_seccomp_required(self):
         result = self.prepare(seccomp=False)
         self.assertGreater(result.returncode, 0)
-        self.assertIn("supply --seccomp FILE", result.stderr)
+        self.assertIn("set seccomp in qmc.conf", result.stderr)
 
     def test_inline_seccomp(self):
         profile = {"defaultAction": "SCMP_ACT_ERRNO", "defaultErrnoRet": 38, "syscalls": []}
@@ -162,8 +192,8 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(self.generated()["linux"]["seccomp"], profile)
 
     def test_paths_and_timezone(self):
-        result = self.prepare(extra=("--rootfs", "/test/rootfs", "--etc-dir", "/test/etc",
-                                     "--var-dir", "/test/var"), env={**os.environ, "TZ": "Europe/Stockholm"})
+        result = self.prepare(settings={"rootfs": "/test/rootfs", "etc-dir": "/test/etc",
+                                        "var-dir": "/test/var"}, env={**os.environ, "TZ": "Europe/Stockholm"})
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.generated()
         self.assertEqual(config["root"]["path"], "/test/rootfs")
@@ -211,8 +241,10 @@ class PrepareTests(unittest.TestCase):
         self.assertIn(f"read {self.resolv}", result.stderr)
 
     def update_resolv(self, *extra, env=None):
+        filename = self.directory / "update.conf"
+        filename.write_text(json.dumps({"resolv-conf": str(self.resolv)}))
         return subprocess.run(
-            [str(LAUNCHER), "update-resolv-conf", "--resolv-conf", str(self.resolv),
+            [str(LAUNCHER), "update-resolv-conf", "--config", str(filename),
              *extra], text=True, capture_output=True,
             env={**os.environ, "RUNTIME_DIRECTORY": str(self.runtime), **(env or {})})
 
@@ -420,13 +452,13 @@ class PrepareTests(unittest.TestCase):
                          [{"containerID": 0, "hostID": 1000000000, "size": 1500000000}])
         self.assertEqual(linux["gidMappings"],
                          [{"containerID": 0, "hostID": 2000000000, "size": 500000000}])
-        result = self.prepare(extra=("--userns", "off"))
+        result = self.prepare(settings={"userns": "off"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("uidMappings", self.generated()["linux"])
 
     @unittest.skipUnless(PRIVATE_PATHS, "requires the smoke test's private /etc and /dev")
     def test_userns_invalid_or_incomplete(self):
-        result = self.prepare(extra=("--userns", "required"))
+        result = self.prepare(settings={"userns": "required"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("required", result.stderr)
         (self.subids / "subuid").write_text("qm_root:1000000000:1000\n")
@@ -452,7 +484,7 @@ class PrepareTests(unittest.TestCase):
     def test_invalid_inputs(self):
         cases = [
             ({"hostname": "bad\nhost"}, "invalid hostname"),
-            ({"extra": ("--userns", "invalid")}, "invalid userns mode"),
+            ({"settings": {"userns": "invalid"}}, "invalid userns mode"),
             ({"base": {**self.base, "annotations": []}}, "invalid annotations"),
             ({"base": {**self.base, "process": {**self.base["process"], "env": [None]}}}, "JSON string"),
             ({"seccomp": {"syscalls": [{"includes": {"minKernel": "6.0"}}]}}, "unsupported seccomp condition"),
@@ -464,9 +496,10 @@ class PrepareTests(unittest.TestCase):
                 self.assertIn(error, result.stderr)
 
     def test_absolute_path_errors(self):
-        for option in ("--runtime-dir", "--rootfs", "--etc-dir", "--var-dir"):
+        for option in ("--runtime-dir", "rootfs", "etc-dir", "var-dir", "base-config", "seccomp", "resolv-conf"):
             with self.subTest(option=option):
-                result = self.prepare(extra=(option, "relative"))
+                result = self.prepare(**({"extra": (option, "relative")} if option.startswith("--")
+                                         else {"settings": {option: "relative"}}))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{option} must be an absolute path", result.stderr)
 
@@ -582,7 +615,10 @@ class PrepareTests(unittest.TestCase):
         state = self.runtime / "state.json"
         state.write_text(saved)
         missing_config = self.directory / "missing.json"
-        command = [str(LAUNCHER), "launch", "--runtime-dir", str(self.runtime), str(missing_config)]
+        filename = self.directory / "qmc.conf"
+        filename.write_text(json.dumps({"base-config": str(missing_config)}))
+        command = [str(LAUNCHER), "launch", "--runtime-dir", str(self.runtime),
+                   "--config", str(filename)]
         result = subprocess.run(command, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cleanup incomplete; continuing startup", result.stderr)
