@@ -54,12 +54,11 @@ static bool opt_verbose;
 static bool opt_prepare_only;
 static char **opt_exec_argv; /* Borrowed from main's argv, NULL-terminated. */
 
-static void log_verbose(bool enabled, const char *format, ...)
-	__attribute__((format(printf, 2, 3)));
+static void debug(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
-static void log_verbose(bool enabled, const char *format, ...)
+static void debug(const char *format, ...)
 {
-	if (!enabled)
+	if (!opt_verbose)
 		return;
 	int saved_errno = errno;
 	va_list args;
@@ -72,12 +71,11 @@ static void log_verbose(bool enabled, const char *format, ...)
 }
 
 /* Global crun options must precede the subcommand. */
-static size_t crun_prefix(char **argv, const char *executable, const char *root,
-			  bool verbose)
+static size_t crun_prefix(char **argv, const char *executable, const char *root)
 {
 	size_t index = 0;
 	argv[index++] = (char *)executable;
-	if (verbose)
+	if (opt_verbose)
 		argv[index++] = "--debug";
 	argv[index++] = "--root";
 	argv[index++] = (char *)root;
@@ -111,7 +109,7 @@ static void save_state(const State *state, const char *runtime_dir, bool replace
 
 static void write_bundle(const Config *configuration, json_object *config);
 
-static int crun_delete(const State *state, bool verbose)
+static int crun_delete(const State *state)
 {
 	if (!state->crun_executable)
 		return 0;
@@ -127,10 +125,9 @@ static int crun_delete(const State *state, bool verbose)
 		return 1;
 	}
 
-	log_verbose(verbose, "Deleting container %s with %s (state root %s)", id,
-		    executable, root);
+	debug("Deleting container %s with %s (state root %s)", id, executable, root);
 	char *argv[CRUN_PREFIX_ARGS + 4];
-	size_t index = crun_prefix(argv, executable, root, verbose);
+	size_t index = crun_prefix(argv, executable, root);
 	argv[index++] = "delete";
 	argv[index++] = "--force";
 	argv[index++] = (char *)id;
@@ -174,13 +171,13 @@ static int remove_runtime_path(const char *path, bool directory)
 	return 1;
 }
 
-static int cleanup(const char *runtime_dir, bool verbose)
+static int cleanup(const char *runtime_dir)
 {
 	autofree char *state_file = join_path(runtime_dir, QM_STATE_FILE);
 	autoclose int state_fd = open(state_file, O_RDONLY | O_CLOEXEC);
 	if (state_fd < 0) {
 		if (errno == ENOENT) {
-			log_verbose(verbose, "No saved cleanup state at %s", state_file);
+			debug("No saved cleanup state at %s", state_file);
 			return remove_runtime_path(runtime_dir, true);
 		}
 		warn("open %s", state_file);
@@ -193,17 +190,17 @@ static int cleanup(const char *runtime_dir, bool verbose)
 		warn("lock cleanup state %s", state_file);
 		return 1;
 	}
-	log_verbose(verbose, "Loading cleanup state from %s", state_file);
+	debug("Loading cleanup state from %s", state_file);
 	autofreejson json_object *object = js_load(state_file);
 	autostate State *state = state_deserialize(object);
-	int result = crun_delete(state, verbose);
-	log_verbose(verbose, "Tearing down recorded network resources");
+	int result = crun_delete(state);
+	debug("Tearing down recorded network resources");
 	result |= network_teardown(state->network);
-	log_verbose(verbose, "Removing recorded network namespace %s",
-		    state->netns ? state->netns : "(none)");
+	debug("Removing recorded network namespace %s",
+	      state->netns ? state->netns : "(none)");
 	result |= teardown_namespace(state->netns);
 	if (!result && state->bundle) {
-		log_verbose(verbose, "Removing runtime bundle %s", state->bundle);
+		debug("Removing runtime bundle %s", state->bundle);
 		result |= remove_tree(state->bundle);
 	}
 	if (!result) {
@@ -212,7 +209,7 @@ static int cleanup(const char *runtime_dir, bool verbose)
 			result |= remove_runtime_path(runtime_dir, true);
 	}
 
-	log_verbose(verbose, "Cleanup %s", result ? "incomplete" : "complete");
+	debug("Cleanup %s", result ? "incomplete" : "complete");
 	return result != 0;
 }
 
@@ -257,7 +254,7 @@ static pid_t start_network(const NetworkOptions *network, const NetworkState *st
 			_exit(0);
 		int result = network_setup(network, state);
 		if (!result)
-			log_verbose(opt_verbose, "Network setup complete");
+			debug("Network setup complete");
 		_exit(result != 0);
 	}
 	status = wait_child(job);
@@ -280,7 +277,7 @@ failed:
 static int setup(const Config *configuration, json_object *config, bool *state_created,
 		 pid_t *network_pid)
 {
-	log_verbose(opt_verbose, "Preparing runtime directory %s", opt_runtime_dir);
+	debug("Preparing runtime directory %s", opt_runtime_dir);
 	ensure_private_directory(opt_runtime_dir);
 	autofree char *netns = join_path(opt_runtime_dir, "netns");
 	/* Do not claim a pre-existing pin, even when it is only an empty file. */
@@ -304,18 +301,17 @@ static int setup(const Config *configuration, json_object *config, bool *state_c
 	};
 	/* Check for conflicts before replacing an earlier cleanup journal. */
 	const NetworkOptions network = get_network_options(configuration);
-	log_verbose(opt_verbose, "Checking network resource ownership");
+	debug("Checking network resource ownership");
 	state->network = network_prepare(&network);
 	if (!state->network) {
 		warnx("QM network preparation failed");
 		return 1;
 	}
-	log_verbose(opt_verbose, "Saving cleanup state in %s/%s", opt_runtime_dir,
-		    QM_STATE_FILE);
+	debug("Saving cleanup state in %s/%s", opt_runtime_dir, QM_STATE_FILE);
 	save_state(state, opt_runtime_dir, true);
 	*state_created = true;
 	write_bundle(configuration, config);
-	log_verbose(opt_verbose, "Creating network namespace %s", netns);
+	debug("Creating network namespace %s", netns);
 	bool netns_file_created;
 	if (network_create_namespace(netns, &netns_file_created)) {
 		if (!netns_file_created) {
@@ -326,11 +322,10 @@ static int setup(const Config *configuration, json_object *config, bool *state_c
 		return 1;
 	}
 
-	log_verbose(opt_verbose,
-		    "Setting up network in background: veth=%s address=%s/%u "
-		    "gateway=%s nftables=%s",
-		    network.veth, network.ip, network.prefix_len, network.gateway,
-		    network.nft_table);
+	debug("Setting up network in background: veth=%s address=%s/%u "
+	      "gateway=%s nftables=%s",
+	      network.veth, network.ip, network.prefix_len, network.gateway,
+	      network.nft_table);
 	autofree char *state_file = join_path(opt_runtime_dir, QM_STATE_FILE);
 	autoclose int state_fd = open(state_file, O_RDONLY | O_CLOEXEC);
 	if (state_fd < 0 || TEMP_FAILURE_RETRY(flock(state_fd, LOCK_SH)) < 0) {
@@ -360,8 +355,8 @@ static int crun_run(json_object *config)
 			return 1;
 		}
 		notify_alias = join_path(opt_runtime_dir, "notify.sock");
-		log_verbose(opt_verbose, "Aliasing host notify socket %s at %s",
-			    notify_socket, notify_alias);
+		debug("Aliasing host notify socket %s at %s", notify_socket,
+		      notify_alias);
 		/* Startup may be continuing after incomplete cleanup. */
 		if (unlink(notify_alias) < 0 && errno != ENOENT) {
 			warn("remove old notify alias %s", notify_alias);
@@ -380,13 +375,13 @@ static int crun_run(json_object *config)
 	pid_t console_pid = -1;
 	if (json_object_get_boolean(js_get(js_get(config, "process"), "terminal"))) {
 		console_socket = join_path(opt_runtime_dir, "console.sock");
-		log_verbose(opt_verbose, "Forwarding container console to stdout");
+		debug("Forwarding container console to stdout");
 		console_pid = console_start(console_socket);
 		if (console_pid < 0)
 			return 1;
 	}
 	char *argv[CRUN_PREFIX_ARGS + 8];
-	size_t index = crun_prefix(argv, CRUN, crun_state, opt_verbose);
+	size_t index = crun_prefix(argv, CRUN, crun_state);
 	argv[index++] = "--cgroup-manager=cgroupfs";
 	argv[index++] = "run";
 	argv[index++] = "--bundle";
@@ -398,11 +393,10 @@ static int crun_run(json_object *config)
 	argv[index++] = QM_CONTAINER_ID;
 	argv[index] = NULL;
 	notify_socket = getenv("NOTIFY_SOCKET");
-	log_verbose(opt_verbose,
-		    "Starting container %s with %s (bundle %s, state root %s, "
-		    "NOTIFY_SOCKET=%s)",
-		    QM_CONTAINER_ID, CRUN, opt_runtime_dir, crun_state,
-		    notify_socket ? notify_socket : "(unset)");
+	debug("Starting container %s with %s (bundle %s, state root %s, "
+	      "NOTIFY_SOCKET=%s)",
+	      QM_CONTAINER_ID, CRUN, opt_runtime_dir, crun_state,
+	      notify_socket ? notify_socket : "(unset)");
 
 	execv(CRUN, argv);
 	warn("exec %s", CRUN);
@@ -423,7 +417,7 @@ static int exec_in_container(void)
 
 	autofree char **argv =
 		xmalloc((CRUN_PREFIX_ARGS + command_count + 5) * sizeof(*argv));
-	size_t index = crun_prefix(argv, CRUN, crun_state, opt_verbose);
+	size_t index = crun_prefix(argv, CRUN, crun_state);
 	argv[index++] = "--cgroup-manager=cgroupfs";
 	argv[index++] = "exec";
 	if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
@@ -431,8 +425,8 @@ static int exec_in_container(void)
 	argv[index++] = (char *)QM_CONTAINER_ID;
 	memcpy(argv + index, opt_exec_argv, (command_count + 1) * sizeof(*argv));
 
-	log_verbose(opt_verbose, "Executing %s in container %s with %s", opt_exec_argv[0],
-		    QM_CONTAINER_ID, CRUN);
+	debug("Executing %s in container %s with %s", opt_exec_argv[0], QM_CONTAINER_ID,
+	      CRUN);
 	execv(CRUN, argv);
 	warn("exec %s", CRUN);
 
@@ -654,7 +648,7 @@ static json_object *id_mapping(IdRange range)
 static void configure_userns(json_object *linux_config, const Config *configuration)
 {
 	if (configuration->userns == USERNS_OFF) {
-		log_verbose(opt_verbose, "User namespace detection disabled");
+		debug("User namespace detection disabled");
 		return;
 	}
 
@@ -663,16 +657,14 @@ static void configure_userns(json_object *linux_config, const Config *configurat
 	if (!uid.found && !gid.found) {
 		if (configuration->userns == USERNS_REQUIRED)
 			errx(1, "%s subordinate ID ranges are required", QM_SUBID_USER);
-		log_verbose(opt_verbose,
-			    "No %s subordinate ID ranges; using base namespaces",
-			    QM_SUBID_USER);
+		debug("No %s subordinate ID ranges; using base namespaces",
+		      QM_SUBID_USER);
 		return;
 	}
 	if (!uid.found || !gid.found)
 		errx(1, "%s requires both subuid and subgid ranges", QM_SUBID_USER);
-	log_verbose(opt_verbose,
-		    "User namespace: uid start=%u count=%u, gid start=%u count=%u",
-		    uid.start, uid.count, gid.start, gid.count);
+	debug("User namespace: uid start=%u count=%u, gid start=%u count=%u", uid.start,
+	      uid.count, gid.start, gid.count);
 
 	if (js_get(linux_config, "uidMappings") || js_get(linux_config, "gidMappings"))
 		errx(1, "base config already has user namespace mappings");
@@ -700,7 +692,7 @@ static void configure_isolation(json_object *linux_config)
 {
 	autofree char *parent = cgroup_parent(opt_prepare_only);
 	autofree char *payload = join_path(parent, PAYLOAD_CGROUP);
-	log_verbose(opt_verbose, "Container cgroup %s", payload);
+	debug("Container cgroup %s", payload);
 	js_set_string(linux_config, "cgroupsPath", payload);
 
 	json_object *namespaces = js_need(linux_config, "namespaces", json_type_array);
@@ -738,8 +730,7 @@ static void configure_annotations(json_object *config)
 
 static json_object *create_config(const Config *configuration)
 {
-	log_verbose(opt_verbose, "Loading OCI configuration from %s",
-		    configuration->base_config);
+	debug("Loading OCI configuration from %s", configuration->base_config);
 	autofreejson json_object *config = js_load(configuration->base_config);
 	override_paths(config, configuration);
 
@@ -748,9 +739,8 @@ static json_object *create_config(const Config *configuration)
 	if (js_string(js_need(config, "root", json_type_object), "path")[0] != '/')
 		errx(1, "root.path must be absolute");
 
-	log_verbose(opt_verbose, "Configuring seccomp from %s",
-		    configuration->seccomp_file ? configuration->seccomp_file
-						: "base config");
+	debug("Configuring seccomp from %s",
+	      configuration->seccomp_file ? configuration->seccomp_file : "base config");
 	configure_seccomp(linux_config, process, configuration->seccomp_file);
 	configure_identity(config, process, configuration->hostname);
 	configure_machine_id(process);
@@ -764,8 +754,8 @@ static json_object *create_config(const Config *configuration)
 	configure_device(config, "/dev/kvm", "/dev/kvm");
 	configure_device(config, "/dev/fuse", "/dev/fuse");
 
-	log_verbose(opt_verbose, "OCI configuration ready: hostname=%s rootfs=%s",
-		    configuration->hostname, js_string(js_get(config, "root"), "path"));
+	debug("OCI configuration ready: hostname=%s rootfs=%s", configuration->hostname,
+	      js_string(js_get(config, "root"), "path"));
 	return steal_ptr(&config);
 }
 
@@ -825,7 +815,7 @@ static void update_container_file(const char *name, const char *contents)
 
 static int update_resolv_conf(const Config *configuration)
 {
-	log_verbose(opt_verbose, "Updating DNS and hosts files in %s", opt_runtime_dir);
+	debug("Updating DNS and hosts files in %s", opt_runtime_dir);
 	autofree char *dns = try_read_text_file(configuration->resolv_conf);
 	if (!dns && errno != ENOENT)
 		err(1, "read %s", configuration->resolv_conf);
@@ -887,8 +877,8 @@ static void write_container_files(const Config *configuration, json_object *conf
 	if (!dns && errno != ENOENT)
 		err(1, "read %s", configuration->resolv_conf);
 	container_file(files, "resolv.conf", dns ? dns : "", context);
-	log_verbose(opt_verbose, "Resolver source %s: %s", configuration->resolv_conf,
-		    dns ? "read" : "missing; wrote empty file");
+	debug("Resolver source %s: %s", configuration->resolv_conf,
+	      dns ? "read" : "missing; wrote empty file");
 
 	autofree char *hosts = read_text_file("/etc/hosts");
 	autofree char *contents = hosts_contents(hosts, configuration);
@@ -897,14 +887,14 @@ static void write_container_files(const Config *configuration, json_object *conf
 
 static void write_bundle(const Config *configuration, json_object *config)
 {
-	log_verbose(opt_verbose, "Writing container files in %s", opt_runtime_dir);
+	debug("Writing container files in %s", opt_runtime_dir);
 	ensure_private_directory(opt_runtime_dir);
 	write_container_files(configuration, config);
 	autofree char *crun_state = join_path(opt_runtime_dir, "crun");
 	ensure_private_directory(crun_state);
 
 	autofree char *oci_config = join_path(opt_runtime_dir, "config.json");
-	log_verbose(opt_verbose, "Writing OCI bundle configuration %s", oci_config);
+	debug("Writing OCI bundle configuration %s", oci_config);
 	js_save(config, oci_config);
 }
 
@@ -1034,7 +1024,7 @@ int main(int argc, char **argv)
 	if (command == COMMAND_EXEC)
 		return exec_in_container();
 	if (command == COMMAND_CLEANUP)
-		return cleanup(opt_runtime_dir, opt_verbose);
+		return cleanup(opt_runtime_dir);
 
 	autofreeconfig Config *configuration =
 		configuration_load(QM_DATA_DIR, QM_CONFIG_DIR, opt_config_file);
@@ -1045,9 +1035,8 @@ int main(int argc, char **argv)
 	if (!opt_prepare_only) {
 		if (geteuid() != 0)
 			errx(1, "launch requires root");
-		log_verbose(opt_verbose, "Checking for pending cleanup in %s",
-			    opt_runtime_dir);
-		if (cleanup(opt_runtime_dir, opt_verbose))
+		debug("Checking for pending cleanup in %s", opt_runtime_dir);
+		if (cleanup(opt_runtime_dir))
 			warnx("cleanup incomplete; continuing startup");
 	}
 
@@ -1067,7 +1056,7 @@ int main(int argc, char **argv)
 	autofreejson json_object *config = create_config(configuration);
 	if (opt_prepare_only) {
 		write_bundle(configuration, config);
-		log_verbose(opt_verbose, "Bundle preparation complete");
+		debug("Bundle preparation complete");
 		return 0;
 	}
 
@@ -1085,7 +1074,7 @@ int main(int argc, char **argv)
 		wait_child(network_pid);
 	}
 	if (state_created)
-		cleanup(opt_runtime_dir, opt_verbose);
+		cleanup(opt_runtime_dir);
 
 	return status;
 }
