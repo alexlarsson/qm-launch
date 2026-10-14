@@ -11,7 +11,15 @@ build_config.set_quoted('QM_DATA_DIR', data_dir)
 build_config.set_quoted('QM_CONFIG_DIR', get_option('prefix') / get_option('sysconfdir'))
 configure_file(output: 'config.h', configuration: build_config)
 
-launcher_sources = ['qm-launch.c', 'qm-utils.c', 'qm-network.c', 'qm-state.c', 'qm-console.c', 'qm-config.c']
+launcher_sources = [
+  'qmc.c',
+  'qm-utils.c',
+  'qm-network.c',
+  'qm-state.c',
+  'qm-console.c',
+  'qm-config.c',
+  'qm-seccomp.c',
+]
 launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables')]
 launcher = executable('qmc', launcher_sources,
   dependencies: launcher_deps, install: true)
