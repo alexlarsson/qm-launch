@@ -11,14 +11,13 @@
 
 typedef struct {
 	const char *runtime_dir;
-	const char *bridge;
 	const char *veth;
 	const char *interface;
 	const char *ip;
 	const char *gateway;
 	const char *subnet; /* IPv4 network address without a prefix length. */
 	unsigned int prefix_len;
-	uint8_t bridge_mac[6];
+	uint8_t veth_mac[6];
 	uint32_t fallback_mtu; /* Used when no default IPv4 route exists. */
 	unsigned int rp_filter;
 	bool disable_ipv6;
@@ -26,6 +25,12 @@ typedef struct {
 } NetworkOptions;
 
 typedef struct NetworkState NetworkState;
+
+/* Create and pin a namespace with loopback already up. Return 0 on success,
+ * 1 on failure. Set *file_created when the pin file was created, even if a
+ * later step failed; the caller must clean it up.
+ */
+int network_create_namespace(const char *path, bool *file_created);
 
 /* Check for conflicts and return allocated cleanup state without changing the
  * network, or NULL on failure. The caller must save it before network_setup().

@@ -588,8 +588,8 @@ class PrepareTests(unittest.TestCase):
         pin.touch()
         state = self.runtime / "state.json"
         invalid_network = json.dumps({"version": 1, "netns": str(pin),
-                                      "network": {"owner": "qm-launch:/saved", "bridge": "a" * 16,
-                                                  "veth": "test-veth", "nft_table": "saved"}})
+                                      "network": {"owner": "qm-launch:/saved",
+                                                  "veth": "a" * 16, "nft_table": "saved"}})
         for contents in ("{", '{"version":2}', '{"version":1,"netns":false}', invalid_network):
             with self.subTest(contents=contents):
                 state.write_text(contents)

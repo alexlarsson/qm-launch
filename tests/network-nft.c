@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <libmnl/libmnl.h>
 #include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <nftables/libnftables.h>
 #include <string.h>
 
@@ -33,10 +34,18 @@ ssize_t __wrap_mnl_socket_sendto(const struct mnl_socket *nl, const void *buffer
 				 size_t length)
 {
 	const struct nlmsghdr *header = buffer;
+	if (getenv("QM_TEST_LOOPBACK_FAIL") && header->nlmsg_type == RTM_NEWLINK &&
+	    !(header->nlmsg_flags & NLM_F_CREATE)) {
+		const struct ifinfomsg *info = mnl_nlmsg_get_payload(header);
+		if (info->ifi_flags & IFF_UP) {
+			errno = EIO;
+			return -1;
+		}
+	}
 	const char *gate = getenv("QM_TEST_LINK_GATE");
 	if (gate && header->nlmsg_type == RTM_NEWLINK &&
 	    (header->nlmsg_flags & NLM_F_CREATE)) {
-		/* Pause before creating the bridge, then let veth creation proceed. */
+		/* Pause before creating the veth pair. Loopback is already up. */
 		unsetenv("QM_TEST_LINK_GATE");
 		wait_gate(gate);
 	}

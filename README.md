@@ -138,20 +138,23 @@ its cgroup path, and crun creates the sibling `payload` cgroup.
 The container retains its cgroup namespace and writable cgroup mount.
 
 The service's namespace is pinned at `/run/qm/netns`. The launcher creates
-bridge `qm-br0` and host veth `qm-veth` through rtnetlink, with `eth0` inside
-QM. It uses subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
+a veth pair through rtnetlink, with `qm-veth` on the host and `eth0` inside
+QM. The gateway address is assigned directly to `qm-veth`; no bridge is needed.
+It uses subnet `10.90.0.0/24`, gateway `10.90.0.1` and container address
 `10.90.0.2`. The interfaces inherit the host's default IPv4 route MTU, falling
 back to 1500 when no default route exists. The MTU is chosen once during setup.
 Host uplink configuration can finish later; QM uses the host's routes for
 outbound traffic without binding its NAT rules to a particular uplink address.
-Once the namespace is pinned, the launcher starts network setup in the
-background and execs crun immediately. Container boot overlaps bridge, veth,
-address, route and firewall setup; `eth0` and connectivity become available
-when the job finishes. Crun remains the service's main process.
+The namespace creation child brings up loopback before pinning the namespace,
+so local networking is ready before container init starts. The launcher then
+starts the remaining network setup in the background and execs crun immediately.
+Container boot overlaps veth, address, route and firewall setup; `eth0` and
+connectivity become available when the job finishes. Crun remains the service's
+main process.
 
 Forwarding and masquerading rules live in a dedicated nftables table,
 `ip qm_launch`. The background network job configures the interfaces and
-installs the firewall rules in the same process. The host links stay down
+installs the firewall rules in the same process. The host veth stays down
 until setup finishes successfully. A temporary monitor aborts crun if network
 setup fails or crashes. Cleanup waits for setup workers using a lock on the saved
 state file, including after crun exits before setup finishes.

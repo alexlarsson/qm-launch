@@ -22,14 +22,13 @@ int main(int argc, char **argv)
 		errx(2, "usage: test-network RUNTIME_DIR [--prepare-only]");
 	const NetworkOptions options = {
 		.runtime_dir = argv[1],
-		.bridge = "test-br0",
 		.veth = "test-veth",
 		.interface = "test0",
 		.ip = "172.30.20.2",
 		.gateway = "172.30.20.1",
 		.subnet = "172.30.20.0",
 		.prefix_len = 28,
-		.bridge_mac = {0x02, 0x00, 0xac, 0x1e, 0x14, 0x01},
+		.veth_mac = {0x02, 0x00, 0xac, 0x1e, 0x14, 0x01},
 		.fallback_mtu = 1234,
 		.rp_filter = 1,
 		.disable_ipv6 = false,
@@ -41,7 +40,7 @@ int main(int argc, char **argv)
 			 .netns = join_path(options.runtime_dir, "netns")};
 	save_state(state, state_file, false);
 	bool created;
-	if (create_net_ns(state->netns, &created))
+	if (network_create_namespace(state->netns, &created))
 		return 1;
 	state->network = network_prepare(&options);
 	if (!state->network)

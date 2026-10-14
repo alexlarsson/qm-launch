@@ -11,11 +11,9 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <linux/magic.h>
-#include <sched.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/wait.h>
@@ -432,45 +430,6 @@ bool ns_is_mounted(const char *path)
 	struct statfs st;
 
 	return statfs(path, &st) == 0 && st.f_type == NSFS_MAGIC;
-}
-
-int create_net_ns(const char *path, bool *file_created)
-{
-	*file_created = false;
-
-	autoclose int fd = TEMP_FAILURE_RETRY(
-		open(path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
-	if (fd < 0) {
-		warn("create %s", path);
-		return 1;
-	}
-	*file_created = true;
-
-	pid_t child = fork();
-	if (child < 0) {
-		warn("fork");
-		return 1;
-	}
-	if (!child) {
-		if (unshare(CLONE_NEWNET) < 0 ||
-		    mount("/proc/self/ns/net", path, NULL, MS_BIND, NULL) < 0) {
-			warn("create network namespace");
-			_exit(1);
-		}
-		_exit(0);
-	}
-
-	int status = wait_child(child);
-	if (status < 0) {
-		warn("wait for network namespace creation");
-		return 1;
-	}
-	if (status) {
-		warnx("network namespace creation failed");
-		return 1;
-	}
-
-	return 0;
 }
 
 int wait_child(pid_t child)

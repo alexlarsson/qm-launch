@@ -90,14 +90,13 @@ static NetworkOptions get_network_options(void)
 {
 	return (NetworkOptions){
 		.runtime_dir = opt_runtime_dir,
-		.bridge = "qm-br0",
 		.veth = "qm-veth",
 		.interface = "eth0",
 		.ip = QM_IP,
 		.gateway = QM_GATEWAY,
 		.subnet = "10.90.0.0",
 		.prefix_len = 24,
-		.bridge_mac = {0x02, 0x00, 0x0a, 0x5a, 0x00, 0x01},
+		.veth_mac = {0x02, 0x00, 0x0a, 0x5a, 0x00, 0x01},
 		.fallback_mtu = 1500,
 		.rp_filter = 2,
 		.disable_ipv6 = true,
@@ -320,7 +319,7 @@ static int setup(const Config *configuration, json_object *config, bool *state_c
 	write_bundle(configuration, config);
 	log_verbose(opt_verbose, "Creating network namespace %s", netns);
 	bool netns_file_created;
-	if (create_net_ns(netns, &netns_file_created)) {
+	if (network_create_namespace(netns, &netns_file_created)) {
 		if (!netns_file_created) {
 			free(state->netns);
 			state->netns = NULL;
@@ -330,10 +329,10 @@ static int setup(const Config *configuration, json_object *config, bool *state_c
 	}
 
 	log_verbose(opt_verbose,
-		    "Setting up network in background: bridge=%s veth=%s address=%s/%u "
+		    "Setting up network in background: veth=%s address=%s/%u "
 		    "gateway=%s nftables=%s",
-		    network.bridge, network.veth, network.ip, network.prefix_len,
-		    network.gateway, network.nft_table);
+		    network.veth, network.ip, network.prefix_len, network.gateway,
+		    network.nft_table);
 	autofree char *state_file = join_path(opt_runtime_dir, QM_STATE_FILE);
 	autoclose int state_fd = open(state_file, O_RDONLY | O_CLOEXEC);
 	if (state_fd < 0 || TEMP_FAILURE_RETRY(flock(state_fd, LOCK_SH)) < 0) {

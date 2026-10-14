@@ -22,13 +22,13 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 
 struct NetworkState {
 	char *owner;
-	char *bridge;
 	char *veth;
 	char *nft_table;
 };
@@ -214,39 +214,19 @@ static int default_mtu(Rtnl *nl, uint32_t fallback, uint32_t *mtu)
 	return 0;
 }
 
-static int create_bridge(Rtnl *nl, const NetworkOptions *options, const char *owner,
-			 uint32_t mtu)
-{
-	Message message;
-	struct nlmsghdr *header = message_init(&message, RTM_NEWLINK,
-					       NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-	mnl_nlmsg_put_extra_header(header, sizeof(struct ifinfomsg));
-	mnl_attr_put_strz(header, IFLA_IFNAME, options->bridge);
-	/* Unlike aliases, the group is applied during link creation. It covers
-	 * recovery if we are killed before the subsequent alias update.
-	 */
-	mnl_attr_put_u32(header, IFLA_GROUP, owner_group(owner));
-	mnl_attr_put_u32(header, IFLA_MTU, mtu);
-	/* A fixed MAC keeps host ARP entries valid across restarts. */
-	mnl_attr_put(header, IFLA_ADDRESS, sizeof(options->bridge_mac),
-		     options->bridge_mac);
-	struct nlattr *kind = mnl_attr_nest_start(header, IFLA_LINKINFO);
-	mnl_attr_put_strz(header, IFLA_INFO_KIND, "bridge");
-	mnl_attr_nest_end(header, kind);
-	return rtnl_request(nl, header, NULL, NULL);
-}
-
 static int create_veth(Rtnl *nl, const NetworkOptions *options, const char *owner,
-		       int bridge, int netns, uint32_t mtu)
+		       int netns, uint32_t mtu)
 {
 	Message message;
 	struct nlmsghdr *header = message_init(&message, RTM_NEWLINK,
 					       NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
 	mnl_nlmsg_put_extra_header(header, sizeof(struct ifinfomsg));
 	mnl_attr_put_strz(header, IFLA_IFNAME, options->veth);
+	/* The group covers recovery before the separate alias update. */
 	mnl_attr_put_u32(header, IFLA_GROUP, owner_group(owner));
 	mnl_attr_put_u32(header, IFLA_MTU, mtu);
-	mnl_attr_put_u32(header, IFLA_MASTER, bridge);
+	/* Keep the gateway's MAC stable across restarts. */
+	mnl_attr_put(header, IFLA_ADDRESS, sizeof(options->veth_mac), options->veth_mac);
 	struct nlattr *kind = mnl_attr_nest_start(header, IFLA_LINKINFO);
 	mnl_attr_put_strz(header, IFLA_INFO_KIND, "veth");
 	struct nlattr *details = mnl_attr_nest_start(header, IFLA_INFO_DATA);
@@ -273,6 +253,56 @@ static int link_change(Rtnl *nl, int index, bool remove)
 		info->ifi_change = IFF_UP;
 	}
 	return rtnl_request(nl, header, NULL, NULL);
+}
+
+int network_create_namespace(const char *path, bool *file_created)
+{
+	*file_created = false;
+	autoclose int fd = TEMP_FAILURE_RETRY(
+		open(path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+	if (fd < 0) {
+		warn("create %s", path);
+		return 1;
+	}
+	*file_created = true;
+
+	pid_t child = fork();
+	if (child < 0) {
+		warn("fork network namespace creation");
+		return 1;
+	}
+	if (!child) {
+		if (unshare(CLONE_NEWNET) < 0) {
+			warn("create network namespace");
+			_exit(1);
+		}
+		/* Initialize local networking before publishing the namespace. This
+		 * runs in the existing creation child, without another fork or setns.
+		 */
+		autortnl Rtnl nl = {0};
+		Link lo;
+		if (rtnl_open(&nl) < 0 || get_link(&nl, "lo", 0, &lo) < 0 || !lo.index ||
+		    link_change(&nl, lo.index, false) < 0) {
+			warn("bring up network namespace loopback");
+			_exit(1);
+		}
+		if (mount("/proc/self/ns/net", path, NULL, MS_BIND, NULL) < 0) {
+			warn("pin network namespace %s", path);
+			_exit(1);
+		}
+		_exit(0);
+	}
+
+	int status = wait_child(child);
+	if (status < 0) {
+		warn("wait for network namespace creation");
+		return 1;
+	}
+	if (status) {
+		warnx("network namespace creation failed");
+		return 1;
+	}
+	return 0;
 }
 
 static int set_alias(Rtnl *nl, int index, const char *owner)
@@ -348,14 +378,13 @@ static int configure_namespace(const NetworkOptions *options, int netns)
 		if (getppid() != parent)
 			_exit(1);
 		autortnl Rtnl nl = {0};
-		Link eth, lo;
+		Link eth;
 		int result = setns(netns, CLONE_NEWNET) < 0 || rtnl_open(&nl) < 0 ||
 			     get_link(&nl, options->interface, 0, &eth) < 0 ||
-			     !eth.index || get_link(&nl, "lo", 0, &lo) < 0 || !lo.index ||
+			     !eth.index ||
 			     interface_sysctls(options, options->interface) ||
 			     add_address(&nl, eth.index, options->ip,
 					 options->prefix_len) < 0 ||
-			     link_change(&nl, lo.index, false) < 0 ||
 			     link_change(&nl, eth.index, false) < 0 ||
 			     add_default_route(&nl, eth.index, options->gateway) < 0;
 		if (result)
@@ -429,23 +458,23 @@ static int nft_setup(struct nft_ctx *ctx, const NetworkOptions *options,
 	if (nft_command(ctx, table))
 		return -1;
 	autofree char *subnet = xasprintf("%s/%u", options->subnet, options->prefix_len);
-	autofree char *rules = xasprintf(
-		"add chain ip %s forward "
-		"{ type filter hook forward priority filter; policy accept; }\n"
-		"add rule ip %s forward "
-		"oifname \"%s\" ct state established,related accept\n"
-		"add rule ip %s forward iifname \"%s\" ip saddr %s accept\n"
-		"add rule ip %s forward iifname \"%s\" drop\n"
-		"add rule ip %s forward oifname \"%s\" ip daddr %s accept\n"
-		"add chain ip %s postrouting "
-		"{ type nat hook postrouting priority srcnat; policy accept; "
-		"}\n"
-		"add rule ip %s postrouting "
-		"ip saddr %s ip daddr != %s masquerade\n",
-		options->nft_table, options->nft_table, options->bridge,
-		options->nft_table, options->bridge, subnet, options->nft_table,
-		options->bridge, options->nft_table, options->bridge, options->ip,
-		options->nft_table, options->nft_table, subnet, subnet);
+	autofree char *rules =
+		xasprintf("add chain ip %s forward "
+			  "{ type filter hook forward priority filter; policy accept; }\n"
+			  "add rule ip %s forward "
+			  "oifname \"%s\" ct state established,related accept\n"
+			  "add rule ip %s forward iifname \"%s\" ip saddr %s accept\n"
+			  "add rule ip %s forward iifname \"%s\" drop\n"
+			  "add rule ip %s forward oifname \"%s\" ip daddr %s accept\n"
+			  "add chain ip %s postrouting "
+			  "{ type nat hook postrouting priority srcnat; policy accept; "
+			  "}\n"
+			  "add rule ip %s postrouting "
+			  "ip saddr %s ip daddr != %s masquerade\n",
+			  options->nft_table, options->nft_table, options->veth,
+			  options->nft_table, options->veth, subnet, options->nft_table,
+			  options->veth, options->nft_table, options->veth, options->ip,
+			  options->nft_table, options->nft_table, subnet, subnet);
 	/* One transaction installs all chains and rules in the owned table. */
 	return nft_command(ctx, rules);
 }
@@ -484,9 +513,9 @@ static bool valid_table(const char *name)
 /* Keep names within rtnetlink's bounds and safe as nftables identifiers. */
 static int validate_options(const NetworkOptions *options)
 {
-	if (!valid_interface(options->bridge) || !valid_interface(options->veth) ||
-	    !valid_interface(options->interface) || !valid_table(options->nft_table) ||
-	    options->prefix_len > 32 || options->rp_filter > 2 || !options->fallback_mtu)
+	if (!valid_interface(options->veth) || !valid_interface(options->interface) ||
+	    !valid_table(options->nft_table) || options->prefix_len > 32 ||
+	    options->rp_filter > 2 || !options->fallback_mtu)
 		goto invalid;
 	const char *addresses[] = {options->ip, options->gateway, options->subnet};
 	for (size_t i = 0; i < N_ELEMENTS(addresses); i++) {
@@ -504,7 +533,6 @@ json_object *network_state_serialize(const NetworkState *state)
 {
 	json_object *object = js_new_object();
 	js_set_string(object, "owner", state->owner);
-	js_set_string(object, "bridge", state->bridge);
 	js_set_string(object, "veth", state->veth);
 	js_set_string(object, "nft_table", state->nft_table);
 	return object;
@@ -513,17 +541,14 @@ json_object *network_state_serialize(const NetworkState *state)
 NetworkState *network_state_deserialize(json_object *object)
 {
 	const char *owner = js_string(object, "owner");
-	const char *bridge = js_string(object, "bridge");
 	const char *veth = js_string(object, "veth");
 	const char *nft_table = js_string(object, "nft_table");
-	if (!valid_interface(bridge) || !valid_interface(veth) ||
-	    !valid_table(nft_table) || !*owner ||
+	if (!valid_interface(veth) || !valid_table(nft_table) || !*owner ||
 	    strlen(owner) >= sizeof(((Link *)0)->alias))
 		errx(1, "invalid saved network state");
 	NetworkState *state = xnew(NetworkState);
 	*state = (NetworkState){
 		.owner = xstrdup(owner),
-		.bridge = xstrdup(bridge),
 		.veth = xstrdup(veth),
 		.nft_table = xstrdup(nft_table),
 	};
@@ -535,7 +560,6 @@ void network_state_free(NetworkState *state)
 	if (!state)
 		return;
 	free(state->owner);
-	free(state->bridge);
 	free(state->veth);
 	free(state->nft_table);
 	free(state);
@@ -556,15 +580,13 @@ NetworkState *network_prepare(const NetworkOptions *options)
 		warn("open rtnetlink");
 		return NULL;
 	}
-	Link bridge, veth;
-	if (get_link(&nl, options->bridge, 0, &bridge) < 0 ||
-	    get_link(&nl, options->veth, 0, &veth) < 0) {
-		warn("find QM network interfaces");
+	Link veth;
+	if (get_link(&nl, options->veth, 0, &veth) < 0) {
+		warn("find QM host veth");
 		return NULL;
 	}
-	if (bridge.index || veth.index) {
-		warnx("%s or %s already exists; run qmc cleanup for its owner",
-		      options->bridge, options->veth);
+	if (veth.index) {
+		warnx("%s already exists; run qmc cleanup for its owner", options->veth);
 		return NULL;
 	}
 	autonft struct nft_ctx *nft = nft_open();
@@ -580,7 +602,6 @@ NetworkState *network_prepare(const NetworkOptions *options)
 	NetworkState *state = xnew(NetworkState);
 	*state = (NetworkState){
 		.owner = steal_ptr(&owner),
-		.bridge = xstrdup(options->bridge),
 		.veth = xstrdup(options->veth),
 		.nft_table = xstrdup(options->nft_table),
 	};
@@ -606,34 +627,29 @@ int network_setup(const NetworkOptions *options, const NetworkState *state)
 		warn("open %s", netns);
 		return 1;
 	}
-	Link bridge, veth;
+	Link veth;
 	autofree char *forwarding =
-		xasprintf("net/ipv4/conf/%s/forwarding", options->bridge);
-	if (create_bridge(&nl, options, owner, mtu) < 0 ||
-	    get_link(&nl, options->bridge, 0, &bridge) < 0 ||
-	    set_alias(&nl, bridge.index, owner) < 0 ||
-	    sysctl_write("net/ipv4/ip_forward", "1", false) ||
-	    sysctl_write(forwarding, "1", false) ||
-	    interface_sysctls(options, options->bridge) ||
-	    add_address(&nl, bridge.index, options->gateway, options->prefix_len) < 0 ||
-	    create_veth(&nl, options, owner, bridge.index, ns, mtu) < 0 ||
+		xasprintf("net/ipv4/conf/%s/forwarding", options->veth);
+	if (create_veth(&nl, options, owner, ns, mtu) < 0 ||
 	    get_link(&nl, options->veth, 0, &veth) < 0 ||
 	    set_alias(&nl, veth.index, owner) < 0 ||
-	    interface_sysctls(options, options->veth)) {
+	    sysctl_write("net/ipv4/ip_forward", "1", false) ||
+	    sysctl_write(forwarding, "1", false) ||
+	    interface_sysctls(options, options->veth) ||
+	    add_address(&nl, veth.index, options->gateway, options->prefix_len) < 0) {
 		warn("set up QM network");
 		return 1;
 	}
 	if (configure_namespace(options, ns))
 		return 1;
 	/* All setup already runs in a background job. Install the firewall in
-	 * that same process, keeping the host links down until it is ready.
+	 * that same process, keeping the host veth down until it is ready.
 	 */
 	autonft struct nft_ctx *nft = nft_open();
 	if (nft_setup(nft, options, owner))
 		return 1;
-	if (link_change(&nl, bridge.index, false) < 0 ||
-	    link_change(&nl, veth.index, false) < 0) {
-		warn("bring up QM network interfaces");
+	if (link_change(&nl, veth.index, false) < 0) {
+		warn("bring up QM host veth");
 		return 1;
 	}
 	return 0;
@@ -665,7 +681,6 @@ int network_teardown(const NetworkState *state)
 	if (!state)
 		return 0;
 	const char *owner = state->owner;
-	const char *bridge = state->bridge;
 	const char *veth = state->veth;
 	const char *nft_table = state->nft_table;
 	int result = 0;
@@ -688,7 +703,6 @@ int network_teardown(const NetworkState *state)
 		result = 1;
 	} else {
 		result |= remove_link(&nl, veth, owner);
-		result |= remove_link(&nl, bridge, owner);
 	}
 	return result;
 }

@@ -80,11 +80,6 @@ char *get_current_cgroup(void);
 
 bool ns_is_mounted(const char *path);
 
-/* Return 0 on success, 1 on failure. Set *file_created when the namespace
- * file was created, even if a later step failed; the caller must clean it up.
- */
-int create_net_ns(const char *path, bool *file_created);
-
 /* Return exit status (128 + signal if killed), or -1 with errno on failure.
  * These helpers do not exit, so cleanup can continue after an error. */
 int wait_child(pid_t child);

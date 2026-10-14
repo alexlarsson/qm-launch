@@ -254,7 +254,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
 
     def assert_network_removed(runtime):
         links = json.loads(run("ip", "-j", "link", "show"))
-        assert not {"qm-br0", "qm-veth"}.intersection(link["ifname"] for link in links)
+        assert "qm-veth" not in {link["ifname"] for link in links}
         assert "qm_launch" not in run("nft", "list", "tables")
         assert "unrelated" in run("nft", "list", "tables")
         assert not (runtime / "netns").exists()
@@ -324,16 +324,23 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         print(run("nsenter", f"--net={runtime / 'netns'}", "ip", "route"), flush=True)
         run("ping", "-c", "1", "-W", "2", container_ip)
         assert "masquerade" in run("nft", "list", "table", "ip", "qm_launch")
-        bridge = json.loads(run("ip", "-j", "link", "show", "qm-br0"))[0]
+        veth = json.loads(run("ip", "-j", "link", "show", "qm-veth"))[0]
         eth = json.loads(run("nsenter", f"--net={runtime / 'netns'}", "ip", "-j", "link", "show", "eth0"))[0]
-        assert bridge["mtu"] == eth["mtu"] == 1400
-        assert bridge["address"] == "02:00:0a:5a:00:01"
-        assert bridge["ifalias"] == f"qm-launch:{runtime}"
+        assert veth["mtu"] == eth["mtu"] == 1400
+        assert veth["address"] == "02:00:0a:5a:00:01"
+        assert veth["ifalias"] == f"qm-launch:{runtime}"
+        assert "master" not in veth
+        assert "qm-br0" not in {link["ifname"] for link in json.loads(run("ip", "-j", "link", "show"))}
+        gateway = json.loads(run("ip", "-j", "-4", "addr", "show", "qm-veth"))[0]
+        assert gateway["addr_info"][0]["local"] == "10.90.0.1"
+        assert gateway["addr_info"][0]["prefixlen"] == 24
+        rules = run("nft", "list", "table", "ip", "qm_launch")
+        assert 'iifname "qm-veth"' in rules and 'oifname "qm-veth"' in rules
         run("nsenter", f"--net={runtime / 'netns'}", "ping", "-c", "1", "-W", "2", "127.0.0.1")
-        pathlib.Path("/proc/sys/net/ipv4/conf/qm-br0/rp_filter").write_text("1\n")
-        run("/usr/lib/systemd/systemd-sysctl", "--prefix=/net/ipv4/conf/qm-br0",
+        pathlib.Path("/proc/sys/net/ipv4/conf/qm-veth/rp_filter").write_text("1\n")
+        run("/usr/lib/systemd/systemd-sysctl", "--prefix=/net/ipv4/conf/qm-veth",
             str(SOURCE / "90-qm-launch.conf"))
-        assert pathlib.Path("/proc/sys/net/ipv4/conf/qm-br0/rp_filter").read_text().strip() == "2"
+        assert pathlib.Path("/proc/sys/net/ipv4/conf/qm-veth/rp_filter").read_text().strip() == "2"
         assert_masquerading(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                             "/init", "--network-check")
         command = [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
@@ -467,7 +474,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         finally:
             run("umount", executable)
 
-    # Fail after bridge creation and check that partial setup is rolled back.
+    # Fail after veth creation and check that partial setup is rolled back.
     forwarding = directory / "read-only-forwarding"
     forwarding.write_text("1\n")
     target = "/proc/sys/net/ipv4/ip_forward"
@@ -488,7 +495,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     # Existing objects are not ours just because their names match.
     for kind in ("interface", "table"):
         if kind == "interface":
-            run("ip", "link", "add", "qm-br0", "type", "dummy")
+            run("ip", "link", "add", "qm-veth", "type", "dummy")
         else:
             run("nft", "add", "table", "ip", "qm_launch", "{ comment \"foreign\"; }")
         try:
@@ -501,13 +508,13 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
             assert not runtime.exists()
             if kind == "interface":
-                run("ip", "link", "show", "qm-br0")
+                run("ip", "link", "show", "qm-veth")
             else:
                 assert "foreign" in run("nft", "list", "table", "ip", "qm_launch")
             assert "unrelated" in run("nft", "list", "tables")
         finally:
             if kind == "interface":
-                run("ip", "link", "delete", "qm-br0")
+                run("ip", "link", "delete", "qm-veth")
             else:
                 run("nft", "delete", "table", "ip", "qm_launch")
     print("Setup preserves interfaces and tables owned by other applications", flush=True)
@@ -572,20 +579,23 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert process.stdout.readline() == "READY\n"
         process.kill()
         process.wait(timeout=5)
-        run("umount", str(runtime / "netns"))
-        (runtime / "netns").unlink()
-        run("ip", "link", "set", "qm-br0", "alias", "another owner")
-        result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)],
-                                text=True, capture_output=True)
-        assert result.returncode == 1, result.stderr
-        assert "another owner" in result.stderr
-        assert (runtime / "state.json").exists()
-        assert "qm_launch" not in run("nft", "list", "tables")
-        run("ip", "link", "show", "qm-br0")
-        # An empty alias represents interruption between creation and tagging.
-        run("ip", "link", "set", "qm-br0", "alias", "")
-        run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
-        assert_network_removed(runtime)
+        # Keep the peer namespace alive while cleanup kills container init.
+        # Otherwise Linux removes the veth before ownership can be checked.
+        with (runtime / "netns").open() as namespace_pin:
+            run("umount", "--lazy", str(runtime / "netns"))
+            (runtime / "netns").unlink()
+            run("ip", "link", "set", "qm-veth", "alias", "another owner")
+            result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)],
+                                    text=True, capture_output=True)
+            assert result.returncode == 1, result.stderr
+            assert "another owner" in result.stderr
+            assert (runtime / "state.json").exists()
+            assert "qm_launch" not in run("nft", "list", "tables")
+            run("ip", "link", "show", "qm-veth")
+            # An empty alias represents interruption between creation and tagging.
+            run("ip", "link", "set", "qm-veth", "alias", "")
+            run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
+            assert_network_removed(runtime)
         process.communicate(timeout=5)
         process, runtime = launch("recovery")
         assert select.select([process.stdout], [], [], 10)[0]
@@ -608,14 +618,14 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     prepared.mkdir(mode=0o700)
     run(helper, str(prepared), "--prepare-only")
     state = json.loads((prepared / "state.json").read_text())
-    assert state["network"]["bridge"] == "test-br0"
+    assert "bridge" not in state["network"]
     links = json.loads(run("ip", "-j", "link", "show"))
-    assert not {"test-br0", "test-veth"}.intersection(link["ifname"] for link in links)
+    assert "test-veth" not in {link["ifname"] for link in links}
     assert "test_network" not in run("nft", "list", "tables")
     run(str(LAUNCHER), "cleanup", "--runtime-dir", str(prepared))
     assert not (prepared / "state.json").exists()
     assert not (prepared / "netns").exists()
-    print("Network preparation saves cleanup state without changing the network", flush=True)
+    print("Network preparation saves state without changing the host network", flush=True)
 
     def wait_until(predicate):
         deadline = time.monotonic() + 5
@@ -661,13 +671,16 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                 worker_fds.append(os.pidfd_open(worker_pid))
                 assert select.select([process.stdout], [], [], 5)[0]
                 assert process.stdout.readline() == "READY\n", "Init waited for network setup"
+                loopback = json.loads(run("nsenter", f"--net={runtime / 'netns'}", "ip",
+                                          "-j", "link", "show", "lo"))[0]
+                assert "UP" in loopback["flags"], loopback
+                run("nsenter", f"--net={runtime / 'netns'}", "ping", "-c", "1", "-W", "2", "127.0.0.1")
                 assert pathlib.Path(f"/proc/{process.pid}/comm").read_text().strip() == "crun"
                 if kinds[0] == "LINK":
-                    assert "qm-br0" not in run("ip", "link", "show")
+                    assert "qm-veth" not in run("ip", "link", "show")
                 else:
-                    for interface in ("qm-br0", "qm-veth"):
-                        link = json.loads(run("ip", "-j", "link", "show", interface))[0]
-                        assert "UP" not in link["flags"], link
+                    link = json.loads(run("ip", "-j", "link", "show", "qm-veth"))[0]
+                    assert "UP" not in link["flags"], link
                 assert "qm_launch" not in run("nft", "list", "tables")
                 if attempt == "parent-crash":
                     process.kill()
@@ -688,9 +701,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                     nft_pid_file = pathlib.Path(f"{nft_gate}.pid")
                     wait_until(lambda: nft_pid_file.exists() and nft_pid_file.read_text().strip())
                     assert int(nft_pid_file.read_text()) == worker_pid
-                    for interface in ("qm-br0", "qm-veth"):
-                        link = json.loads(run("ip", "-j", "link", "show", interface))[0]
-                        assert "UP" not in link["flags"], link
+                    link = json.loads(run("ip", "-j", "link", "show", "qm-veth"))[0]
+                    assert "UP" not in link["flags"], link
                     assert "qm_launch" not in run("nft", "list", "tables")
                     os.write(nft_fd, b"1")
                     def network_up():
@@ -730,7 +742,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
             base.write_text(json.dumps(config))
             run(str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime))
         assert_network_removed(runtime)
-    print("Container boots during network setup; job failures, crashes and concurrent cleanup passed", flush=True)
+    print("Loopback is ready before container boot; background setup, job failures, crashes and concurrent cleanup passed", flush=True)
 
     # Exercise the backend with names, subnet, MAC, MTU and sysctls different from QM.
     custom = directory / "custom-network"
@@ -738,9 +750,9 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     run("ip", "route", "del", "default")
     try:
         run(helper, str(custom))
-        bridge = json.loads(run("ip", "-j", "link", "show", "test-br0"))[0]
-        assert bridge["address"] == "02:00:ac:1e:14:01"
-        assert bridge["mtu"] == 1234
+        veth = json.loads(run("ip", "-j", "link", "show", "test-veth"))[0]
+        assert veth["address"] == "02:00:ac:1e:14:01"
+        assert veth["mtu"] == 1234
         run("ip", "link", "show", "test-veth")
         address = json.loads(run("nsenter", f"--net={custom / 'netns'}", "ip",
                                  "-j", "-4", "addr", "show", "test0"))[0]
@@ -752,13 +764,12 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         run("ping", "-c", "1", "-W", "2", "172.30.20.2")
         assert_masquerading("nsenter", f"--net={custom / 'netns'}",
                             str(rootfs / "init"), "--network-check")
-        for interface in ("test-br0", "test-veth"):
-            assert pathlib.Path(f"/proc/sys/net/ipv4/conf/{interface}/rp_filter").read_text().strip() == "1"
-            ipv6 = pathlib.Path(f"/proc/sys/net/ipv6/conf/{interface}/disable_ipv6")
-            if ipv6.exists():
-                assert ipv6.read_text().strip() == "0"
+        assert pathlib.Path("/proc/sys/net/ipv4/conf/test-veth/rp_filter").read_text().strip() == "1"
+        ipv6 = pathlib.Path("/proc/sys/net/ipv6/conf/test-veth/disable_ipv6")
+        if ipv6.exists():
+            assert ipv6.read_text().strip() == "0"
         state = json.loads((custom / "state.json").read_text())
-        assert state["network"]["bridge"] == "test-br0"
+        assert "bridge" not in state["network"]
         assert state["network"]["veth"] == "test-veth"
         assert state["network"]["nft_table"] == "test_network"
         # The regular launcher cleans up this other configuration using only
@@ -771,7 +782,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert not (cleanup_dir / "state.json").exists()
         assert not (custom / "netns").exists()
         links = json.loads(run("ip", "-j", "link", "show"))
-        assert not {"test-br0", "test-veth"}.intersection(link["ifname"] for link in links)
+        assert "test-veth" not in {link["ifname"] for link in links}
         assert "test_network" not in run("nft", "list", "tables")
         assert "unrelated" in run("nft", "list", "tables")
         print("Non-default network options, NAT, fallback MTU and cleanup from saved state passed", flush=True)
@@ -780,6 +791,15 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         if (directory / "custom-cleanup").exists():
             run(str(LAUNCHER), "cleanup", "--runtime-dir", str(directory / "custom-cleanup"))
         run("ip", "route", "add", "default", "via", "192.0.2.2")
+
+    process, runtime = launch("loopback-failure", launcher=LAUNCHER.parent / "test-launch-network",
+                              env={"QM_TEST_LOOPBACK_FAIL": "1"})
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 1, (stdout, stderr)
+    assert "bring up network namespace loopback" in stderr, stderr
+    assert "READY" not in stdout, stdout
+    assert_network_removed(runtime)
+    print("Loopback setup failure aborts launch and rolls back namespace preparation", flush=True)
 
     process, runtime = launch("namespace-create-failure", existing_netns=True)
     stdout, stderr = process.communicate(timeout=10)
