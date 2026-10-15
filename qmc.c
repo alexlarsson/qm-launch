@@ -8,6 +8,7 @@
 #include "qm-config.h"
 #include "qm-console.h"
 #include "qm-network.h"
+#include "qm-oci-config.h"
 #include "qm-seccomp.h"
 #include "qm-state.h"
 #include "qm-utils.h"
@@ -28,7 +29,6 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -539,70 +539,6 @@ static void configure_mounts(json_object *config, const char *files)
 		autofree char *source = join_path(files, sources[i].filename);
 		override_mount_source(config, sources[i].destination, source);
 	}
-
-	json_object *mounts = js_need(config, "mounts", json_type_array);
-	for (size_t i = json_object_array_length(mounts); i > 0; i--) {
-		json_object *mount = json_object_array_get_idx(mounts, i - 1);
-		if (strcmp(js_string(mount, "destination"), "/etc/localtime") ||
-		    strcmp(js_string(mount, "type"), "bind"))
-			continue;
-		const char *source = js_string(mount, "source");
-		struct stat st;
-		if (stat(source, &st) < 0) {
-			if (errno != ENOENT)
-				err(1, "stat %s", source);
-			json_object_array_del_idx(mounts, i - 1, 1);
-		}
-	}
-}
-
-/* Update an existing destination, or append it when absent. The source, type
- * and options are replaced together so an old mount's flags cannot leak in. */
-static void set_bind_mount(json_object *config, const char *destination,
-			   const char *source, const char *const flags[], size_t n_flags)
-{
-	json_object *mount = find_mount(config, destination);
-	if (!mount) {
-		mount = js_new_object();
-		js_set_string(mount, "destination", destination);
-		js_array_add(js_need(config, "mounts", json_type_array), mount);
-	}
-
-	js_set_string(mount, "type", "bind");
-	js_set_string(mount, "source", source);
-	js_object_add(mount, "options", js_new_strings(flags, n_flags));
-}
-
-static void add_device_rule(json_object *config, dev_t device)
-{
-	json_object *resources = js_need(js_need(config, "linux", json_type_object),
-					 "resources", json_type_object);
-	json_object *rules = js_need(resources, "devices", json_type_array);
-
-	autofreejson json_object *rule = js_new_object();
-	js_object_add(rule, "allow", js_new_bool(true));
-	js_set_string(rule, "type", "c");
-	js_object_add(rule, "major", js_new_int(major(device)));
-	js_object_add(rule, "minor", js_new_int(minor(device)));
-	js_set_string(rule, "access", "rwm");
-	js_array_add(rules, steal_ptr(&rule));
-}
-
-static void configure_device(json_object *config, const char *source,
-			     const char *destination)
-{
-	struct stat st;
-	if (stat(source, &st) < 0) {
-		if (errno == ENOENT)
-			return;
-		err(1, "stat %s", source);
-	}
-	if (!S_ISCHR(st.st_mode))
-		errx(1, "%s is not a character device", source);
-
-	const char *const flags[] = {"bind", "rprivate", "nosuid", "noexec"};
-	set_bind_mount(config, destination, source, flags, N_ELEMENTS(flags));
-	add_device_rule(config, st.st_rdev);
 }
 
 static void configure_seccomp(json_object *linux_config, json_object *process,
@@ -721,6 +657,7 @@ static json_object *create_config(const Config *configuration)
 	json_object *process = js_need(config, "process", json_type_object);
 	if (js_string(js_need(config, "root", json_type_object), "path")[0] != '/')
 		errx(1, "root.path must be absolute");
+	configure_oci_policy(config, configuration);
 
 	debug("Configuring seccomp from %s",
 	      configuration->seccomp_file ? configuration->seccomp_file : "base config");
@@ -733,9 +670,6 @@ static json_object *create_config(const Config *configuration)
 
 	autofree char *files = join_path(opt_runtime_dir, "files");
 	configure_mounts(config, files);
-
-	configure_device(config, "/dev/kvm", "/dev/kvm");
-	configure_device(config, "/dev/fuse", "/dev/fuse");
 
 	debug("OCI configuration ready: hostname=%s rootfs=%s", configuration->hostname,
 	      js_string(js_get(config, "root"), "path"));

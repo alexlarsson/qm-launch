@@ -8,6 +8,18 @@
   "etc-dir": "/etc/qm",
   "var-dir": "/var/qm",
   "seccomp": "/usr/share/qm/seccomp-no-rt.json",
+  "devices": [
+    {"source": "/dev/kvm", "optional": true},
+    {"source": "/dev/fuse", "optional": true}
+  ],
+  "mounts": [
+    {
+      "source": "/etc/localtime",
+      "destination": "/etc/localtime",
+      "optional": true,
+      "options": ["bind", "rprivate", "ro", "nosuid", "noexec", "nodev"]
+    }
+  ],
   "userns": "auto",
   "verbose": true
 }

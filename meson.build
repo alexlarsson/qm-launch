@@ -18,6 +18,7 @@ launcher_sources = [
   'qm-state.c',
   'qm-console.c',
   'qm-config.c',
+  'qm-oci-config.c',
   'qm-seccomp.c',
 ]
 launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables')]

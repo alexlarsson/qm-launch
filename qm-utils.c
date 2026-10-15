@@ -92,6 +92,31 @@ void strv_builder_clear(StrvBuilder *builder)
 	*builder = (StrvBuilder){0};
 }
 
+void ptr_array_add(PtrArray *array, void *item)
+{
+	if (array->length == array->capacity) {
+		size_t capacity = array->capacity ? array->capacity * 2 : 8;
+		if (capacity <= array->capacity ||
+		    capacity > SIZE_MAX / sizeof(*array->items))
+			oom();
+
+		array->items = xrealloc(array->items, capacity * sizeof(*array->items));
+		array->capacity = capacity;
+	}
+
+	array->items[array->length++] = item;
+}
+
+void ptr_array_clear(PtrArray *array, void (*free_func)(void *))
+{
+	if (free_func)
+		for (size_t i = 0; i < array->length; i++)
+			free_func(array->items[i]);
+
+	free(array->items);
+	*array = (PtrArray){0};
+}
+
 bool starts_with(const char *string, const char *prefix)
 {
 	return strncmp(string, prefix, strlen(prefix)) == 0;
@@ -103,6 +128,79 @@ char *join_path(const char *a, const char *b)
 		b++;
 
 	return xasprintf("%s%s%s", a, *a && a[strlen(a) - 1] != '/' ? "/" : "", b);
+}
+
+char *canonicalize_path(const char *path)
+{
+	if (*path != '/') {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	char *result = xmalloc(strlen(path) + 1);
+	char *out = result;
+	*out++ = '/';
+
+	while (*path) {
+		while (*path == '/')
+			path++;
+
+		const char *component = path;
+		while (*path && *path != '/')
+			path++;
+		size_t length = path - component;
+		if (!length || (length == 1 && component[0] == '.'))
+			continue;
+
+		if (length == 2 && component[0] == '.' && component[1] == '.') {
+			while (out > result + 1 && out[-1] != '/')
+				out--;
+			if (out > result + 1)
+				out--;
+			continue;
+		}
+
+		if (out > result + 1)
+			*out++ = '/';
+		memcpy(out, component, length);
+		out += length;
+	}
+	*out = '\0';
+
+	return result;
+}
+
+bool parse_size(const char *string, int64_t *size)
+{
+	if (!strcmp(string, "infinity")) {
+		*size = -1;
+		return true;
+	}
+
+	/* strtoull accepts signs and leading whitespace; sizes do not. */
+	if (*string < '0' || *string > '9')
+		return false;
+
+	errno = 0;
+	char *p;
+	uint64_t bytes = strtoull(string, &p, 10);
+	if (errno || !bytes || bytes > INT64_MAX)
+		return false;
+
+	if (*p) {
+		const char *units = "KMGTPE";
+		const char *unit = strchr(units, *p++);
+		if (!unit || (*p && strcmp(p, "B") && strcmp(p, "iB")))
+			return false;
+
+		uint64_t multiplier = UINT64_C(1) << (10 * (unit - units + 1));
+		if (bytes > INT64_MAX / multiplier)
+			return false;
+		bytes *= multiplier;
+	}
+
+	*size = bytes;
+	return true;
 }
 
 char *try_read_text_file(const char *filename)

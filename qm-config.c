@@ -18,133 +18,450 @@
 
 #define DEFAULT_HOSTNAME "qm"
 
-typedef enum {
-	CONFIG_STRING,
-	CONFIG_PATH,
-	CONFIG_HOSTNAME,
-	CONFIG_IPV4,
-	CONFIG_PREFIX_LENGTH,
-	CONFIG_USERNS,
-	CONFIG_BOOL,
-} ConfigValueType;
+typedef struct {
+	/* json_type_null delegates type checking to parse (e.g. size strings/ints).
+	 * For arrays, parse handles one element and appends to the target PtrArray.
+	 */
+	enum json_type type;
+	void (*parse)(void *field, json_object *value, const char *name,
+		      const char *filename);
+	void (*destroy)(void *value); /* Owned pointer, or an array element. */
+} ConfigParser;
 
 typedef struct {
 	const char *name;
 	size_t offset;
-	ConfigValueType type;
+	const ConfigParser *parser;
+	bool required;
+	bool track_presence;
+	size_t presence_offset;
 } ConfigEntry;
 
-#define CONFIG_ENTRY(name, member, type) {name, offsetof(Config, member), type}
+#define CONFIG_ENTRY(struct_type, key, member, value_parser, ...)                        \
+	{.name = key,                                                                    \
+	 .offset = offsetof(struct_type, member),                                        \
+	 .parser = &value_parser,                                                        \
+	 __VA_ARGS__}
+
+static void parse_object(void *target, json_object *object, const ConfigEntry *entries,
+			 size_t count, const char *name, const char *filename)
+{
+	if (!json_object_is_type(object, json_type_object))
+		errx(1, "%s: %s must be a JSON object", filename, name);
+
+	json_object_object_foreach (object, key, unused) {
+		(void)unused;
+		size_t i;
+		for (i = 0; i < count; i++)
+			if (!strcmp(key, entries[i].name))
+				break;
+		if (i == count)
+			errx(1, "%s: unknown %s key: %s", filename, name, key);
+	}
+
+	/* Table order also defines precedence between fields that share a list. */
+	for (size_t i = 0; i < count; i++) {
+		const ConfigEntry *entry = &entries[i];
+		json_object *value;
+		if (!json_object_object_get_ex(object, entry->name, &value)) {
+			if (entry->required)
+				errx(1, "%s: %s.%s is required", filename, name,
+				     entry->name);
+			continue;
+		}
+
+		autofree char *field_name = xasprintf("%s.%s", name, entry->name);
+		const ConfigParser *parser = entry->parser;
+		if (parser->type != json_type_null &&
+		    !json_object_is_type(value, parser->type))
+			errx(1, "%s: %s must be a JSON %s", filename, field_name,
+			     json_type_to_name(parser->type));
+
+		void *field = (char *)target + entry->offset;
+		if (parser->type == json_type_array) {
+			for (size_t j = 0; j < json_object_array_length(value); j++) {
+				autofree char *item_name =
+					xasprintf("%s[%zu]", field_name, j);
+				parser->parse(field, json_object_array_get_idx(value, j),
+					      item_name, filename);
+			}
+		} else {
+			parser->parse(field, value, field_name, filename);
+		}
+
+		if (entry->track_presence)
+			*(bool *)((char *)target + entry->presence_offset) = true;
+	}
+}
+
+static void clear_object(void *target, const ConfigEntry *entries, size_t count)
+{
+	for (size_t i = 0; i < count; i++) {
+		const ConfigEntry *entry = &entries[i];
+		if (!entry->parser->destroy)
+			continue;
+
+		void *field = (char *)target + entry->offset;
+		if (entry->parser->type == json_type_array) {
+			ptr_array_clear(field, entry->parser->destroy);
+		} else {
+			entry->parser->destroy(*(void **)field);
+			*(void **)field = NULL;
+		}
+	}
+}
+
+static const char *config_string(json_object *value, const char *name,
+				 const char *filename)
+{
+	if (!json_object_is_type(value, json_type_string))
+		errx(1, "%s: %s must be a JSON string", filename, name);
+
+	const char *string = json_object_get_string(value);
+	if (strlen(string) != (size_t)json_object_get_string_len(value))
+		errx(1, "%s: %s contains a NUL byte", filename, name);
+
+	return string;
+}
+
+static void parse_memory(void *field, json_object *value, const char *name,
+			 const char *filename)
+{
+	if (json_object_is_type(value, json_type_int)) {
+		if (json_object_get_int64(value) <= 0 ||
+		    json_object_get_uint64(value) > INT64_MAX)
+			errx(1, "%s: memory-max must be positive or infinity", filename);
+		*(int64_t *)field = json_object_get_int64(value);
+		return;
+	}
+
+	const char *string = config_string(value, name, filename);
+	if (!parse_size(string, field))
+		errx(1, "%s: invalid memory-max: %s", filename, string);
+}
+
+static char *absolute_path(json_object *value, const char *name, const char *filename)
+{
+	const char *path = config_string(value, name, filename);
+	if (*path != '/')
+		errx(1, "%s: %s must be an absolute path", filename, name);
+
+	return canonicalize_path(path);
+}
+
+static void replace_string(void *field, char *string)
+{
+	free(*(char **)field);
+	*(char **)field = string;
+}
+
+static void parse_path(void *field, json_object *value, const char *name,
+		       const char *filename)
+{
+	replace_string(field, absolute_path(value, name, filename));
+}
+
+static void parse_hostname(void *field, json_object *value, const char *name,
+			   const char *filename)
+{
+	const char *string = config_string(value, name, filename);
+	if (!*string || strlen(string) > 64 ||
+	    strspn(string, "abcdefghijklmnopqrstuvwxyz"
+			   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+			   "0123456789.-") != strlen(string))
+		errx(1, "%s: invalid hostname", filename);
+
+	replace_string(field, xstrdup(string));
+}
+
+static void parse_ipv4(void *field, json_object *value, const char *name,
+		       const char *filename)
+{
+	const char *string = config_string(value, name, filename);
+	struct in_addr address;
+	if (inet_pton(AF_INET, string, &address) != 1)
+		errx(1, "%s: %s must be an IPv4 address", filename, name);
+
+	uint32_t ip = ntohl(address.s_addr);
+	if (!(ip >> 24) || (ip >> 24) == 127 || (ip >> 24) >= 224)
+		errx(1, "%s: %s must be a unicast IPv4 address", filename, name);
+
+	replace_string(field, xstrdup(string));
+}
+
+static void parse_prefix_length(void *field, json_object *value, const char *name,
+				const char *filename)
+{
+	int64_t prefix = json_object_get_int64(value);
+	if (prefix < 1 || prefix > 31)
+		errx(1, "%s: %s must be between 1 and 31", filename, name);
+
+	*(unsigned int *)field = prefix;
+}
+
+static void parse_userns(void *field, json_object *value, const char *name,
+			 const char *filename)
+{
+	static const char *const names[] = {
+		[USERNS_AUTO] = "auto",
+		[USERNS_OFF] = "off",
+		[USERNS_REQUIRED] = "required",
+	};
+	const char *string = config_string(value, name, filename);
+	for (size_t i = 0; i < N_ELEMENTS(names); i++) {
+		if (!strcmp(string, names[i])) {
+			*(UserNamespaceMode *)field = i;
+			return;
+		}
+	}
+
+	errx(1, "%s: invalid userns mode: %s", filename, string);
+}
+
+static void parse_bool(void *field, json_object *value, const char *name,
+		       const char *filename)
+{
+	(void)name;
+	(void)filename;
+	*(bool *)field = json_object_get_boolean(value);
+}
+
+static void append_string(void *field, json_object *value, const char *name,
+			  const char *filename)
+{
+	ptr_array_add(field, xstrdup(config_string(value, name, filename)));
+}
+
+static const ConfigParser path_parser = {json_type_string, parse_path, free};
+static const ConfigParser hostname_parser = {json_type_string, parse_hostname, free};
+static const ConfigParser ipv4_parser = {json_type_string, parse_ipv4, free};
+static const ConfigParser prefix_parser = {json_type_int, parse_prefix_length, NULL};
+static const ConfigParser userns_parser = {json_type_string, parse_userns, NULL};
+static const ConfigParser bool_parser = {json_type_boolean, parse_bool, NULL};
+static const ConfigParser memory_parser = {json_type_null, parse_memory, NULL};
+static const ConfigParser strings_parser = {json_type_array, append_string, free};
+
+static const ConfigEntry mount_entries[] = {
+	CONFIG_ENTRY(PathOperation, "source", source, path_parser, .required = true),
+	CONFIG_ENTRY(PathOperation, "destination", destination, path_parser,
+		     .required = true),
+	CONFIG_ENTRY(PathOperation, "remove", remove, bool_parser),
+	CONFIG_ENTRY(PathOperation, "optional", optional, bool_parser),
+	CONFIG_ENTRY(PathOperation, "options", options, strings_parser,
+		     .track_presence = true,
+		     .presence_offset = offsetof(PathOperation, options_set)),
+};
+
+static const ConfigEntry device_entries[] = {
+	CONFIG_ENTRY(PathOperation, "source", source, path_parser, .required = true),
+	CONFIG_ENTRY(PathOperation, "destination", destination, path_parser),
+	CONFIG_ENTRY(PathOperation, "remove", remove, bool_parser),
+	CONFIG_ENTRY(PathOperation, "optional", optional, bool_parser),
+};
+
+static const ConfigEntry removal_entries[] = {
+	CONFIG_ENTRY(PathOperation, "destination", destination, path_parser,
+		     .required = true),
+	CONFIG_ENTRY(PathOperation, "remove", remove, bool_parser),
+};
+
+static void path_operation_free(void *data)
+{
+	clear_object(data, mount_entries, N_ELEMENTS(mount_entries));
+	free(data);
+}
+
+static bool reserved_mount(const char *destination)
+{
+	const char *const reserved[] = {"/",
+					"/run/.containerenv",
+					"/run/secrets",
+					"/etc/hostname",
+					"/etc/resolv.conf",
+					"/etc/hosts"};
+
+	for (size_t i = 0; i < N_ELEMENTS(reserved); i++)
+		if (!strcmp(destination, reserved[i]))
+			return true;
+
+	return false;
+}
+
+static void parse_path_operation(PtrArray *operations, json_object *value, bool device,
+				 const char *name, const char *filename)
+{
+	bool remove = json_object_is_type(value, json_type_object) &&
+		      json_object_get_boolean(js_get(value, "remove"));
+	const ConfigEntry *entries = mount_entries;
+	size_t count = N_ELEMENTS(mount_entries);
+	if (remove) {
+		entries = removal_entries;
+		count = N_ELEMENTS(removal_entries);
+	} else if (device) {
+		entries = device_entries;
+		count = N_ELEMENTS(device_entries);
+	}
+
+	PathOperation *operation = xnew(PathOperation);
+	*operation = (PathOperation){.device = device};
+	ptr_array_add(operations, operation);
+	parse_object(operation, value, entries, count, name, filename);
+
+	if (!operation->destination)
+		operation->destination = xstrdup(operation->source);
+	if (reserved_mount(operation->destination))
+		errx(1, "%s: reserved mount destination: %s", filename,
+		     operation->destination);
+}
+
+static void parse_mount(void *field, json_object *value, const char *name,
+			const char *filename)
+{
+	parse_path_operation(field, value, false, name, filename);
+}
+
+static void parse_device(void *field, json_object *value, const char *name,
+			 const char *filename)
+{
+	parse_path_operation(field, value, true, name, filename);
+}
+
+static const char *const capability_names[] = {
+	"CAP_CHOWN",
+	"CAP_DAC_OVERRIDE",
+	"CAP_DAC_READ_SEARCH",
+	"CAP_FOWNER",
+	"CAP_FSETID",
+	"CAP_KILL",
+	"CAP_SETGID",
+	"CAP_SETUID",
+	"CAP_SETPCAP",
+	"CAP_LINUX_IMMUTABLE",
+	"CAP_NET_BIND_SERVICE",
+	"CAP_NET_BROADCAST",
+	"CAP_NET_ADMIN",
+	"CAP_NET_RAW",
+	"CAP_IPC_LOCK",
+	"CAP_IPC_OWNER",
+	"CAP_SYS_MODULE",
+	"CAP_SYS_RAWIO",
+	"CAP_SYS_CHROOT",
+	"CAP_SYS_PTRACE",
+	"CAP_SYS_PACCT",
+	"CAP_SYS_ADMIN",
+	"CAP_SYS_BOOT",
+	"CAP_SYS_NICE",
+	"CAP_SYS_RESOURCE",
+	"CAP_SYS_TIME",
+	"CAP_SYS_TTY_CONFIG",
+	"CAP_MKNOD",
+	"CAP_LEASE",
+	"CAP_AUDIT_WRITE",
+	"CAP_AUDIT_CONTROL",
+	"CAP_SETFCAP",
+	"CAP_MAC_OVERRIDE",
+	"CAP_MAC_ADMIN",
+	"CAP_SYSLOG",
+	"CAP_WAKE_ALARM",
+	"CAP_BLOCK_SUSPEND",
+	"CAP_AUDIT_READ",
+	"CAP_PERFMON",
+	"CAP_BPF",
+	"CAP_CHECKPOINT_RESTORE",
+};
+
+static void parse_capability(PtrArray *operations, json_object *value, bool remove,
+			     const char *field_name, const char *filename)
+{
+	const char *name = config_string(value, field_name, filename);
+	bool all = !strcasecmp(name, "all"), found = false;
+	if (!strncasecmp(name, "CAP_", 4))
+		name += 4;
+
+	for (size_t i = 0; i < N_ELEMENTS(capability_names); i++) {
+		if (!all && strcasecmp(name, capability_names[i] + 4))
+			continue;
+
+		found = true;
+		CapabilityOperation *operation = xnew(CapabilityOperation);
+		*operation = (CapabilityOperation){
+			.name = capability_names[i],
+			.remove = remove,
+		};
+		ptr_array_add(operations, operation);
+	}
+
+	if (!found)
+		errx(1, "%s: unknown capability: %s", filename, name);
+}
+
+static void parse_add_capability(void *field, json_object *value, const char *name,
+				 const char *filename)
+{
+	parse_capability(field, value, false, name, filename);
+}
+
+static void parse_drop_capability(void *field, json_object *value, const char *name,
+				  const char *filename)
+{
+	parse_capability(field, value, true, name, filename);
+}
+
+static void parse_unmask(void *field, json_object *value, const char *name,
+			 const char *filename)
+{
+	const char *path = config_string(value, name, filename);
+	char *canonical;
+	if (strcmp(path, "ALL"))
+		canonical = absolute_path(value, name, filename);
+	else
+		canonical = xstrdup(path);
+
+	ptr_array_add(field, canonical);
+}
+
+static const ConfigParser mounts_parser = {json_type_array, parse_mount,
+					   path_operation_free};
+static const ConfigParser devices_parser = {json_type_array, parse_device,
+					    path_operation_free};
+static const ConfigParser add_caps_parser = {json_type_array, parse_add_capability, free};
+static const ConfigParser drop_caps_parser = {json_type_array, parse_drop_capability,
+					      free};
+static const ConfigParser unmask_parser = {json_type_array, parse_unmask, free};
 
 static const ConfigEntry config_entries[] = {
-	CONFIG_ENTRY("base-config", base_config, CONFIG_PATH),
-	CONFIG_ENTRY("hostname", hostname, CONFIG_HOSTNAME),
-	CONFIG_ENTRY("rootfs", rootfs, CONFIG_PATH),
-	CONFIG_ENTRY("etc-dir", etc_dir, CONFIG_PATH),
-	CONFIG_ENTRY("var-dir", var_dir, CONFIG_PATH),
-	CONFIG_ENTRY("seccomp", seccomp_file, CONFIG_PATH),
-	CONFIG_ENTRY("resolv-conf", resolv_conf, CONFIG_PATH),
-	CONFIG_ENTRY("ip", ip, CONFIG_IPV4),
-	CONFIG_ENTRY("gateway", gateway, CONFIG_IPV4),
-	CONFIG_ENTRY("prefix-length", prefix_length, CONFIG_PREFIX_LENGTH),
-	CONFIG_ENTRY("userns", userns, CONFIG_USERNS),
-	CONFIG_ENTRY("verbose", verbose, CONFIG_BOOL),
-};
+	CONFIG_ENTRY(Config, "base-config", base_config, path_parser),
+	CONFIG_ENTRY(Config, "hostname", hostname, hostname_parser),
+	CONFIG_ENTRY(Config, "rootfs", rootfs, path_parser),
+	CONFIG_ENTRY(Config, "etc-dir", etc_dir, path_parser),
+	CONFIG_ENTRY(Config, "var-dir", var_dir, path_parser),
+	CONFIG_ENTRY(Config, "seccomp", seccomp_file, path_parser),
+	CONFIG_ENTRY(Config, "resolv-conf", resolv_conf, path_parser),
+	CONFIG_ENTRY(Config, "ip", ip, ipv4_parser),
+	CONFIG_ENTRY(Config, "gateway", gateway, ipv4_parser),
+	CONFIG_ENTRY(Config, "prefix-length", prefix_length, prefix_parser),
+	CONFIG_ENTRY(Config, "userns", userns, userns_parser),
+	CONFIG_ENTRY(Config, "verbose", verbose, bool_parser),
+	CONFIG_ENTRY(Config, "memory-max", memory_max, memory_parser,
+		     .track_presence = true,
+		     .presence_offset = offsetof(Config, memory_max_set)),
 
-static const char *const userns_names[] = {
-	[USERNS_AUTO] = "auto",
-	[USERNS_OFF] = "off",
-	[USERNS_REQUIRED] = "required",
+	/* These pairs share a target list; table order defines per-file precedence. */
+	CONFIG_ENTRY(Config, "mounts", path_operations, mounts_parser),
+	CONFIG_ENTRY(Config, "devices", path_operations, devices_parser),
+	CONFIG_ENTRY(Config, "drop-capabilities", capability_operations,
+		     drop_caps_parser),
+	CONFIG_ENTRY(Config, "add-capabilities", capability_operations, add_caps_parser),
+	CONFIG_ENTRY(Config, "unmask", unmask, unmask_parser),
 };
-
-static bool string_type(ConfigValueType type)
-{
-	return type == CONFIG_STRING || type == CONFIG_PATH || type == CONFIG_HOSTNAME ||
-	       type == CONFIG_IPV4;
-}
 
 void config_free(Config *config)
 {
 	if (!config)
 		return;
-	for (size_t i = 0; i < N_ELEMENTS(config_entries); i++) {
-		const ConfigEntry *entry = &config_entries[i];
-		if (string_type(entry->type))
-			free(*(char **)((char *)config + entry->offset));
-	}
+
+	clear_object(config, config_entries, N_ELEMENTS(config_entries));
 	free(config);
-}
-
-static void parse_entry(Config *config, const ConfigEntry *entry, json_object *value,
-			const char *filename)
-{
-	bool boolean = entry->type == CONFIG_BOOL;
-	bool integer = entry->type == CONFIG_PREFIX_LENGTH;
-	enum json_type expected_type = json_type_string;
-	if (boolean)
-		expected_type = json_type_boolean;
-	else if (integer)
-		expected_type = json_type_int;
-	if (!json_object_is_type(value, expected_type))
-		errx(1, "%s: %s must be a JSON %s", filename, entry->name,
-		     json_type_to_name(expected_type));
-	void *field = (char *)config + entry->offset;
-	if (boolean) {
-		*(bool *)field = json_object_get_boolean(value);
-		return;
-	}
-	if (integer) {
-		int64_t prefix = json_object_get_int64(value);
-		if (prefix < 1 || prefix > 31)
-			errx(1, "%s: %s must be between 1 and 31", filename, entry->name);
-		*(unsigned int *)field = prefix;
-		return;
-	}
-
-	const char *string = json_object_get_string(value);
-	if (strlen(string) != (size_t)json_object_get_string_len(value))
-		errx(1, "%s: %s contains a NUL byte", filename, entry->name);
-	switch (entry->type) {
-	case CONFIG_IPV4: {
-		struct in_addr address;
-		if (inet_pton(AF_INET, string, &address) != 1)
-			errx(1, "%s: %s must be an IPv4 address", filename, entry->name);
-		uint32_t ip = ntohl(address.s_addr);
-		if (!(ip >> 24) || (ip >> 24) == 127 || (ip >> 24) >= 224)
-			errx(1, "%s: %s must be a unicast IPv4 address", filename,
-			     entry->name);
-		break;
-	}
-	case CONFIG_PATH:
-		if (string[0] != '/')
-			errx(1, "%s: %s must be an absolute path: %s", filename,
-			     entry->name, string);
-		break;
-	case CONFIG_HOSTNAME:
-		if (!*string || strlen(string) > 64 ||
-		    strspn(string, "abcdefghijklmnopqrstuvwxyz"
-				   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-				   "0123456789.-") != strlen(string))
-			errx(1, "%s: invalid hostname", filename);
-		break;
-	case CONFIG_USERNS:
-		for (size_t i = 0; i < N_ELEMENTS(userns_names); i++) {
-			if (!strcmp(string, userns_names[i])) {
-				*(UserNamespaceMode *)field = i;
-				return;
-			}
-		}
-		errx(1, "%s: invalid userns mode: %s", filename, string);
-	case CONFIG_STRING:
-		break;
-	case CONFIG_BOOL:
-	case CONFIG_PREFIX_LENGTH:
-		/* Handled above. */
-		abort();
-	}
-
-	free(*(char **)field);
-	*(char **)field = xstrdup(string);
 }
 
 static void validate_network(Config *config)
@@ -188,21 +505,9 @@ static void merge_file(Config *config, const char *filename, bool optional)
 	json_tokener_free(tokener);
 	if (error != json_tokener_success)
 		errx(1, "%s: %s", filename, json_tokener_error_desc(error));
-	if (!json_object_is_type(layer, json_type_object))
-		errx(1, "%s: expected a JSON object", filename);
 
-	json_object_object_foreach (layer, key, value) {
-		const ConfigEntry *entry = NULL;
-		for (size_t i = 0; i < N_ELEMENTS(config_entries); i++) {
-			if (!strcmp(key, config_entries[i].name)) {
-				entry = &config_entries[i];
-				break;
-			}
-		}
-		if (!entry)
-			errx(1, "%s: unknown configuration key: %s", filename, key);
-		parse_entry(config, entry, value, filename);
-	}
+	parse_object(config, layer, config_entries, N_ELEMENTS(config_entries),
+		     "configuration", filename);
 }
 
 static int conf_filter(const struct dirent *entry)

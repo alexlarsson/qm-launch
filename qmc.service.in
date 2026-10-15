@@ -52,7 +52,7 @@ Restart=always
 RestartSec=5s
 SyslogIdentifier=%N
 
-# Forward an explicit TZ override. The base config also binds host /etc/localtime.
+# Forward an explicit TZ override. Vendor qmc.conf also binds host /etc/localtime.
 PassEnvironment=TZ
 
 # Use a separate runtime directory so this service can sit alongside qm.service.

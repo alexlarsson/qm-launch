@@ -37,6 +37,7 @@ class PrepareTests(unittest.TestCase):
             for name in ("kvm", "fuse"):
                 (self.devices / name).unlink(missing_ok=True)
         self.base = json.loads((SOURCE / "qm.json").read_text())
+        self.vendor = json.loads((SOURCE / "qmc.conf.in").read_text())
         self.seccomp = json.loads((SOURCE / "tests/seccomp-no-rt.json").read_text())
 
     def prepare(self, base=None, seccomp=None, hostname="qm", extra=(), env=None,
@@ -51,6 +52,8 @@ class PrepareTests(unittest.TestCase):
             "base-config": str(self.directory / "base.json"),
             "hostname": hostname,
             "userns": "auto" if PRIVATE_PATHS else "off",
+            "mounts": self.vendor["mounts"],
+            "devices": self.vendor["devices"],
         }
         if seccomp is not False:
             config["seccomp"] = str(self.directory / "seccomp.json")
@@ -235,13 +238,165 @@ class PrepareTests(unittest.TestCase):
             self.assertNotIn("/etc/localtime", mounts)
 
     def test_missing_localtime_mount(self):
-        for mount in self.base["mounts"]:
-            if mount["destination"] == "/etc/localtime":
-                mount["source"] = str(self.directory / "missing-localtime")
-        result = self.prepare()
+        result = self.prepare(settings={"mounts": [{
+            "source": str(self.directory / "missing-localtime"),
+            "destination": "/etc/localtime", "optional": True}]})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(m["destination"] == "/etc/localtime"
                              for m in self.generated()["mounts"]))
+
+    def test_mount_operations_and_optional_sources(self):
+        source = self.directory / "shared"
+        source.mkdir()
+        self.base["mounts"].append({"type": "tmpfs", "source": "tmpfs",
+                                    "destination": "/shared", "options": ["ro", "nodev"]})
+        missing = str(self.directory / "missing")
+        result = self.prepare(settings={"mounts": [
+            {"destination": "/etc/localtime", "remove": True},
+            {"source": missing, "destination": "/shared", "optional": True},
+            {"source": str(source) + "/missing/..", "destination": "/shared/./",
+             "options": ["rbind", "ro"]},
+            {"source": missing, "destination": "/absent", "optional": True},
+            {"source": missing, "destination": "/removed"},
+            {"destination": "/removed/child/..", "remove": True}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mounts = self.generated()["mounts"]
+        self.assertEqual([m for m in mounts if m["destination"] == "/shared"], [
+            {"source": str(source), "destination": "/shared", "type": "bind",
+             "options": ["rbind", "ro"]}])
+        self.assertFalse(any(m["destination"] in ("/etc/localtime", "/absent", "/removed")
+                             for m in mounts))
+
+    def test_mount_replacement_preserves_order_and_empty_options(self):
+        source = str(self.directory)
+        destinations = ["/shared-tree", *[f"/shared-tree/child-{i}" for i in range(20)]]
+        result = self.prepare(settings={"mounts": [
+            *[{"source": source, "destination": dest} for dest in destinations],
+            {"source": source, "destination": "/shared-tree", "options": []}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mounts = [m for m in self.generated()["mounts"]
+                  if m["destination"] in destinations]
+        self.assertEqual([m["destination"] for m in mounts], destinations)
+        self.assertEqual(mounts[0]["options"], [])
+        self.assertTrue(all(m["options"] == ["rbind", "rprivate"] for m in mounts[1:]))
+
+    def test_device_operations_resolve_before_granting_access(self):
+        missing = str(self.directory / "missing")
+        result = self.prepare(settings={"devices": [
+            {"source": "/dev/null", "destination": "/dev/test"},
+            {"source": "/dev/zero", "destination": "/dev/test"},
+            {"source": "/dev/null", "destination": "/dev/removed"},
+            {"destination": "/dev/removed", "remove": True},
+            {"source": missing, "destination": "/dev/absent", "optional": True}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()
+        mounts = {m["destination"]: m for m in config["mounts"]}
+        self.assertEqual(mounts["/dev/test"]["source"], "/dev/zero")
+        self.assertNotIn("/dev/removed", mounts)
+        self.assertNotIn("/dev/absent", mounts)
+        self.assertEqual(config["linux"]["resources"]["devices"], [
+            *self.base["linux"]["resources"]["devices"],
+            {"allow": True, "type": "c", "major": 1, "minor": 5, "access": "rwm"}])
+
+    def test_device_removal_preserves_shared_base_access(self):
+        self.base["linux"]["devices"] = [
+            {"path": path, "type": "c", "major": 1, "minor": 3}
+            for path in ("/dev/a", "/dev/b")]
+        rule = {"allow": True, "type": "c", "major": 1, "minor": 3, "access": "rwm"}
+        self.base["linux"]["resources"]["devices"].append(rule)
+        result = self.prepare(settings={"devices": [{"destination": "/dev/a", "remove": True}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()["linux"]
+        self.assertEqual([d["path"] for d in config["devices"]], ["/dev/b"])
+        self.assertIn(rule, config["resources"]["devices"])
+        result = self.prepare(settings={"devices": [
+            {"source": "/dev/null", "destination": "/dev/c"},
+            {"destination": "/dev/a", "remove": True},
+            {"destination": "/dev/b", "remove": True}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()["linux"]
+        self.assertEqual(config["devices"], [])
+        self.assertEqual(config["resources"]["devices"].count(rule), 1)
+
+    def test_devices_and_mounts_share_destination_identity(self):
+        self.base["mounts"].append({"destination": "/shared", "source": "tmpfs",
+                                    "type": "tmpfs", "options": []})
+        result = self.prepare(settings={
+            "mounts": [{"source": "/dev/null", "destination": "/shared"}],
+            "devices": [{"destination": "/shared", "remove": True}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(m["destination"] == "/shared"
+                             for m in self.generated()["mounts"]))
+
+    def test_required_or_invalid_device_fails(self):
+        for source, optional in [(str(self.directory / "missing"), False),
+                                 (str(self.directory), True)]:
+            with self.subTest(source=source):
+                result = self.prepare(settings={"devices": [
+                    {"source": source, "destination": "/dev/test", "optional": optional}]})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(source, result.stderr)
+
+    def test_optional_mount_does_not_hide_other_stat_errors(self):
+        loop = self.directory / "loop"
+        loop.symlink_to(loop)
+        result = self.prepare(settings={"mounts": [
+            {"source": str(loop), "destination": "/shared", "optional": True}]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(str(loop), result.stderr)
+
+    def test_payload_memory_limit_preserves_other_resources(self):
+        self.base["linux"]["resources"]["memory"] = {"limit": 123, "swap": 456}
+        for value, expected in [(None, 123), ("5G", 5 * 1024 ** 3), ("infinity", -1)]:
+            with self.subTest(value=value):
+                result = self.prepare(settings={"memory-max": value} if value else {})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.generated()["linux"]
+                self.assertEqual(config["resources"]["memory"], {"limit": expected, "swap": 456})
+                self.assertTrue(config["cgroupsPath"].endswith("/payload"))
+                self.assertEqual(config["resources"]["pids"], {"limit": -1})
+
+    def test_capability_changes_precede_seccomp_resolution(self):
+        self.base["process"]["capabilities"]["ambient"] = ["CAP_NET_RAW"]
+        self.base["process"]["capabilities"]["inheritable"] = ["CAP_NET_RAW"]
+        profile = {"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [
+            {"names": ["getpid"], "action": "SCMP_ACT_ALLOW",
+             "includes": {"caps": ["CAP_SYS_RESOURCE"]}},
+            {"names": ["getppid"], "action": "SCMP_ACT_ALLOW",
+             "includes": {"caps": ["CAP_NET_RAW"]}}]}
+        result = self.prepare(seccomp=profile, settings={
+            "add-capabilities": ["sys_resource", "CAP_SYS_RESOURCE"],
+            "drop-capabilities": ["net_raw"]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()
+        caps = config["process"]["capabilities"]
+        for name in ("bounding", "effective", "permitted"):
+            self.assertEqual(caps[name].count("CAP_SYS_RESOURCE"), 1)
+            self.assertNotIn("CAP_NET_RAW", caps[name])
+        self.assertEqual(caps["ambient"], [])
+        self.assertEqual(caps["inheritable"], [])
+        self.assertEqual(config["linux"]["seccomp"]["syscalls"], [
+            {"names": ["getpid"], "action": "SCMP_ACT_ALLOW"}])
+
+    def test_drop_all_then_add_capability(self):
+        result = self.prepare(settings={"drop-capabilities": ["all"],
+                                        "add-capabilities": ["CAP_CHOWN"]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.generated()["process"]["capabilities"], {
+            name: ["CAP_CHOWN"] for name in ("bounding", "effective", "permitted")})
+
+    def test_unmask_specific_paths_and_all(self):
+        result = self.prepare(settings={"unmask": ["/proc/./keys/", "/proc/unused/../sys", "/absent"]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        linux = self.generated()["linux"]
+        self.assertEqual(linux["maskedPaths"], [p for p in self.base["linux"]["maskedPaths"]
+                                                 if p != "/proc/keys"])
+        self.assertEqual(linux["readonlyPaths"], [p for p in self.base["linux"]["readonlyPaths"]
+                                                   if p != "/proc/sys"])
+        result = self.prepare(settings={"unmask": ["ALL"]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.generated()["linux"]["maskedPaths"], [])
+        self.assertEqual(self.generated()["linux"]["readonlyPaths"], [])
 
     def test_missing_resolver(self):
         self.resolv.unlink()
@@ -420,12 +575,14 @@ class PrepareTests(unittest.TestCase):
     def test_static_mount_settings_are_preserved(self):
         localtime = self.directory / "localtime"
         localtime.touch()
+        self.base["mounts"].append({"destination": "/etc/localtime", "type": "bind",
+                                    "source": str(localtime), "options": ["bind", "ro"]})
         for mount in self.base["mounts"]:
             if mount["destination"] == "/dev/shm":
                 mount["options"] = ["rw", "nosuid", "nodev", "size=128m"]
             elif mount["destination"] == "/etc/localtime":
                 mount["source"] = str(localtime)
-        result = self.prepare()
+        result = self.prepare(settings={"mounts": []})
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = [m for m in self.base["mounts"]
                     if m["destination"] in ("/dev/shm", "/etc/localtime")]

@@ -37,7 +37,9 @@ Container settings come from JSON configuration files, loaded in this order:
 4. `/etc/qmc.conf.d/*.conf`, sorted by filename
 
 Missing main files and directories are allowed. Each file is a JSON object;
-later values override earlier values for the same key. Drop-ins with the same
+later scalar values override earlier values for the same key. Mount, device,
+capability and unmask lists accumulate in configuration load order; an empty
+list adds no operations. Drop-ins with the same
 filename in both directories are both read. Sorting uses byte order, independent
 of the host locale. Files with other suffixes are ignored. Invalid JSON, unknown
 keys and incorrect value types cause an error identifying the file.
@@ -69,6 +71,12 @@ Supported keys are:
 | `resolv-conf` | Absolute path to the host resolver file; otherwise select the available host resolver automatically |
 | `userns` | `auto` (default), `off`, or `required` |
 | `verbose` | JSON boolean enabling launcher phase logging and crun debug output |
+| `memory-max` | Payload memory limit: positive integer bytes, a size string such as `"5G"`, or `"infinity"` |
+| `mounts` | Ordered array of bind mount additions, replacements and removals |
+| `devices` | Ordered array of device additions, replacements and removals |
+| `add-capabilities` | Array of capabilities to add to bounding, effective and permitted sets |
+| `drop-capabilities` | Array of capabilities to remove from all capability sets |
+| `unmask` | Array of container paths to remove from masked and readonly path lists, or `["ALL"]` |
 
 Addresses, paths and mode values are strings. IP and gateway must be distinct
 usable addresses in the same subnet; the subnet is derived from `ip` and
@@ -87,6 +95,73 @@ configuration supplies the root filesystem and bind sources. Without `seccomp`,
 the base configuration must contain an inline filter. The installed vendor file
 sets `rootfs` to `/usr/lib/qm/rootfs`, `etc-dir` to `/etc/qm`, `var-dir` to
 `/var/qm`, and `seccomp` to `/usr/share/qm/seccomp-no-rt.json`.
+
+The vendor configuration also supplies optional `/dev/kvm` and `/dev/fuse`
+devices and an optional read-only host `/etc/localtime` bind mount. These are
+ordinary configuration entries; standalone `--config` files must include any
+of these defaults they need. To use the regular containers seccomp profile
+instead of QM's additional realtime scheduling restrictions, set `seccomp`
+to `/usr/share/containers/seccomp.json`.
+
+Mount objects have absolute `source` and `destination` paths, an optional
+boolean `optional` (default false), and an optional `options` array of mount
+flags. Default options are `["rbind", "rprivate"]`; explicit options replace
+that list. Device objects have an absolute `source`, an optional `destination`
+(defaulting to the source), and an optional boolean `optional`. Both character
+and block devices are supported; device directories and patterns are not.
+Devices use a bind mount and a matching `rwm` device cgroup permission.
+For either kind, `optional: true` skips a missing source; other lookup errors
+still fail.
+
+Container destination is the identity for mounts and devices. Later entries
+replace earlier requests at that destination, including entries of the other
+kind. An object with `"remove": true` requires only `destination` and `remove`;
+it removes the mount/device at that destination, and a later addition can restore
+it. Requests are resolved before probing optional sources or granting device
+access. Within each configuration file, mount entries precede device entries,
+independent of JSON key order. Existing OCI mounts are replaced in place; new
+mounts are appended in first-destination order, so place parent mounts before
+their children. For example, `/etc/qmc.conf.d/50-workload.conf` could contain:
+
+```json
+{
+  "memory-max": "5G",
+  "devices": [
+    {"destination": "/dev/kvm", "remove": true},
+    {"source": "/dev/net/tun", "optional": true}
+  ],
+  "mounts": [
+    {"destination": "/etc/localtime", "remove": true},
+    {
+      "source": "/var/lib/shared",
+      "destination": "/var/lib/shared",
+      "options": ["rbind", "rprivate", "ro"]
+    }
+  ],
+  "add-capabilities": ["CAP_SYS_RESOURCE"]
+}
+```
+
+Configuration paths are normalized lexically: repeated slashes, trailing slashes,
+and `.` or `..` components are resolved without filesystem access or following
+symlinks. Mount/device destinations `/`, `/etc/hosts`, `/etc/hostname`,
+`/etc/resolv.conf`, `/run/.containerenv` and `/run/secrets` are reserved. Explicit mount/device
+entries take precedence over `etc-dir` and `var-dir` mount source overrides.
+
+`memory-max` sets `linux.resources.memory.limit` on the `payload` cgroup,
+including nested containers. It leaves the sibling `supervisor` cgroup alone;
+service-wide systemd memory limits still constrain both. Omission preserves
+any limit from the base OCI JSON; `"infinity"` explicitly sets an unlimited
+payload limit. Size strings use binary units `K`, `M`, `G`, `T`, `P` or `E`,
+optionally followed by `B` or `iB`; `"5G"` means 5 × 1024³ bytes. Zero, negative,
+fractional and overflowing values are rejected.
+
+Capability names are case-insensitive, with an optional `CAP_` prefix; `all`
+expands to the capabilities known to the launcher. Within a file, drops precede
+additions, so an addition wins when both name the same capability. Across files,
+operations follow configuration load order. Changes are applied before resolving
+capability-dependent seccomp rules. `unmask` removes exact paths from both OCI
+`maskedPaths` and `readonlyPaths`; it does not change explicit read-only mounts.
 
 `qmc.service` runs `qmc launch`; container settings no longer require editing
 its command line. `--config FILE` on `launch` or `update-resolv-conf` loads
@@ -148,8 +223,9 @@ If the host file contains an invalid ID, including the first-boot value
 `uninitialized`, the launcher warns and leaves the init arguments unchanged so
 systemd can select the container's ID.
 Custom init commands retain their arguments.
-The base JSON defines the `/dev/shm` tmpfs and read-only host `/etc/localtime`
-bind mount, which is omitted when its source is missing. Runtime setup replaces
+The base JSON defines the `/dev/shm` tmpfs. The vendor configuration defines
+the read-only host `/etc/localtime` bind mount, omitted when its source is missing.
+Runtime setup replaces
 Podman's generated mount sources and removes
 `container_uuid`. Systemd starts the launcher in
 the service's `supervisor` subgroup. The launcher strips that component from
@@ -296,7 +372,7 @@ changing namespaces or cgroups or applying SELinux labels.
 
 The optional live smoke test runs with temporary user, mount and network
 namespaces, plus a delegated transient user service. It exercises cgroup
-delegation, native networking, MTU selection, NAT traffic, foreground crun,
+delegation, payload memory limits, native networking, MTU selection, NAT traffic, foreground crun,
 TCP MSS clamping with a late smaller-MTU uplink, host firewall coexistence,
 graceful shutdown, failure rollback and crash recovery. It also checks that
 interface and firewall setup use the same process and links stay down until

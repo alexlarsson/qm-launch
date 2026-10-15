@@ -62,8 +62,32 @@ void strv_builder_clear(StrvBuilder *builder);
 
 #define autofreestrvbuilder __attribute__((cleanup(strv_builder_clear)))
 
+/* A growing array of pointers. Initialize to {0}. Clear optionally frees each
+ * element with free_func, then frees the array and resets it to {0}.
+ */
+typedef struct {
+	void **items;
+	size_t length;
+	size_t capacity;
+} PtrArray;
+
+void ptr_array_add(PtrArray *array, void *item);
+void ptr_array_clear(PtrArray *array, void (*free_func)(void *));
+
 bool starts_with(const char *string, const char *prefix);
 char *join_path(const char *a, const char *b);
+
+/* Return an allocated absolute path with repeated slashes, . and .. resolved
+ * lexically, without filesystem I/O or following symlinks. Relative paths
+ * return NULL with errno set to EINVAL; .. at the root stays at the root.
+ */
+char *canonicalize_path(const char *path);
+
+/* Parse positive bytes with an optional binary K/M/G/T/P/E suffix (optionally
+ * followed by B or iB), or "infinity" as -1. Return false for invalid input or
+ * values exceeding INT64_MAX, leaving size unchanged.
+ */
+bool parse_size(const char *string, int64_t *size);
 
 char *read_text_file(const char *filename);
 /* Return NULL with errno set on open/read failure. */

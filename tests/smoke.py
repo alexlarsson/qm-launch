@@ -36,6 +36,7 @@ def wait_until(condition):
 
 INIT = r'''
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -58,6 +59,26 @@ static void ready(int signum) {
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--check-bindings")) {
+        char contents[32] = {0};
+        int fd = open("/shared/token", O_RDONLY);
+        if (fd < 0 || read(fd, contents, sizeof(contents) - 1) != 13 ||
+            strcmp(contents, "shared token\n"))
+            return 21;
+        close(fd);
+        errno = 0;
+        fd = open("/shared/token", O_WRONLY);
+        if (fd >= 0 || errno != EROFS)
+            return 22;
+        fd = open("/dev/test-null", O_RDONLY);
+        if (fd < 0 || read(fd, contents, 1) != 0)
+            return 24;
+        close(fd);
+        if (access("/dev/removed", F_OK) == 0 || access("/optional", F_OK) == 0)
+            return 25;
+        puts("BINDINGS OK");
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--console-fail")) {
         /* Like systemd PID 1, discard inherited stdio and reopen the console. */
         for (int fd = 0; fd < 3; fd++)
@@ -352,7 +373,22 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     runtime.mkdir(mode=0o1700)
     runtime_fd = os.open(runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     original_runtime = os.fstat(runtime_fd)
-    process, runtime = launch('normal with "quotes" and \\slashes', settings={"hostname": "qm-test"})
+    shared = directory / "shared-token"
+    shared.write_text("shared token\n")
+    memory_limits = {path: (path / "memory.max").read_text()
+                     if (path / "memory.max").exists() else "max\n"
+                     for path in (service, supervisor)}
+    process, runtime = launch('normal with "quotes" and \\slashes',
+                              settings={"hostname": "qm-test", "memory-max": "256M",
+                                        "mounts": [
+                                            {"source": str(shared), "destination": "/shared/token",
+                                             "options": ["bind", "ro"]},
+                                            {"source": str(directory / "missing"),
+                                             "destination": "/optional", "optional": True}],
+                                        "devices": [
+                                            {"source": "/dev/null", "destination": "/dev/test-null"},
+                                            {"source": "/dev/zero", "destination": "/dev/removed"},
+                                            {"destination": "/dev/removed", "remove": True}]})
     try:
         ready = False
         output = b""
@@ -374,6 +410,11 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert runtime.stat().st_ino == original_runtime.st_ino
         assert runtime.stat().st_mode == original_runtime.st_mode
         assert (service / "payload/init.scope").exists()
+        assert (service / "payload/memory.max").read_text().strip() == str(256 * 1024 ** 2)
+        for path, limit in memory_limits.items():
+            assert (path / "memory.max").read_text() == limit
+        assert run(str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
+                   "/init", "--check-bindings") == "BINDINGS OK\n"
         assert (service / "cgroup.procs").read_text() == ""
         assert (runtime / "files/resolv.conf").read_text() == ""
         for contents in ("search example.test\nnameserver 192.0.2.53\n",

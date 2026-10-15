@@ -304,19 +304,6 @@
       ]
     },
     {
-      "destination": "/etc/localtime",
-      "type": "bind",
-      "source": "/etc/localtime",
-      "options": [
-        "bind",
-        "rprivate",
-        "ro",
-        "nosuid",
-        "noexec",
-        "nodev"
-      ]
-    },
-    {
       "destination": "/etc/hostname",
       "type": "bind",
       "options": [

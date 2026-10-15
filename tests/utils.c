@@ -88,8 +88,89 @@ pid_t __wrap_fork(void)
 	return __real_fork();
 }
 
+static void test_canonicalize_path(void)
+{
+	const struct {
+		const char *path;
+		const char *expected;
+	} cases[] = {
+		{"/", "/"},
+		{"////", "/"},
+		{"/a", "/a"},
+		{"/a/b", "/a/b"},
+		{"//a///b//", "/a/b"},
+		{"/./a/./b/.", "/a/b"},
+		{"/a/../b", "/b"},
+		{"/a/b/..", "/a"},
+		{"/a/b/../../..", "/"},
+		{"/../../a/../b", "/b"},
+		{"/a/.../.hidden/..b", "/a/.../.hidden/..b"},
+		{"/missing-qm-path/child/../file", "/missing-qm-path/file"},
+		/* /proc/self is a symlink; normalization must remain lexical. */
+		{"/proc/self/../file", "/proc/file"},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(cases); i++) {
+		autofree char *path = canonicalize_path(cases[i].path);
+		assert(path && !strcmp(path, cases[i].expected));
+	}
+
+	errno = 0;
+	assert(canonicalize_path("") == NULL && errno == EINVAL);
+	errno = 0;
+	assert(canonicalize_path("relative/path") == NULL && errno == EINVAL);
+}
+
+static unsigned freed_items;
+
+static void free_item(void *item)
+{
+	assert(*(int *)item == (int)freed_items++);
+	free(item);
+}
+
+static void test_ptr_array(void)
+{
+	PtrArray array = {0};
+	ptr_array_clear(&array, free_item);
+	assert(freed_items == 0);
+
+	for (int i = 0; i < 128; i++) {
+		int *item = xnew(int);
+		*item = i;
+		ptr_array_add(&array, item);
+	}
+	assert(array.length == 128);
+	for (size_t i = 0; i < array.length; i++)
+		assert(*(int *)array.items[i] == (int)i);
+
+	ptr_array_clear(&array, free_item);
+	assert(freed_items == 128);
+	assert(array.items == NULL && array.length == 0 && array.capacity == 0);
+
+	/* Reuse with borrowed pointers, including NULL. */
+	int borrowed = 42;
+	ptr_array_add(&array, &borrowed);
+	ptr_array_add(&array, NULL);
+	assert(array.length == 2 && array.items[0] == &borrowed &&
+	       array.items[1] == NULL);
+	ptr_array_clear(&array, NULL);
+	assert(borrowed == 42);
+	assert(array.items == NULL && array.length == 0 && array.capacity == 0);
+}
+
 int main(void)
 {
+	test_canonicalize_path();
+	test_ptr_array();
+
+	int64_t size;
+	assert(parse_size("5GiB", &size) && size == INT64_C(5) * 1024 * 1024 * 1024);
+	assert(parse_size("infinity", &size) && size == -1);
+	assert(parse_size("9223372036854775807", &size) && size == INT64_MAX);
+	assert(!parse_size("8E", &size) && size == INT64_MAX);
+	assert(!parse_size("invalid", &size) && size == INT64_MAX);
+
 	autofreestrvbuilder StrvBuilder builder = {0};
 	const char *first = "first string";
 	strv_builder_add(&builder, first);
