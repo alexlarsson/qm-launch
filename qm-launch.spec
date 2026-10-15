@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Alexander Larsson
 # See COPYING for the full license text.
 
@@ -7,7 +7,7 @@ Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Launch the QM container directly with crun
 
-License:        LGPL-2.1-or-later
+License:        GPL-2.0-only
 URL:            https://github.com/alexlarsson/qm-launch
 Source0:        %{name}-%{version}.tar.xz
 

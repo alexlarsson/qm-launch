@@ -3,6 +3,9 @@ using crun directly. The intent is to be smaller and boot faster. It
 is hardcoded for the needs of qm, and is not flexible enough for any
 kind of generic use.
 
+qmc is licensed under the GNU General Public License, version 2 only
+(`GPL-2.0-only`). See [COPYING](COPYING) for the full license text.
+
 The goal of this work is to eventually be inserted into the main
 qm module, replacing the quadlet qm.container with qmc.service.
 Additionally the "qmc" binary on the host replaces various things
