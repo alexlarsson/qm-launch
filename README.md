@@ -1,8 +1,15 @@
-qmc is an experimental podman-less launcher for the qm
-container, using crun directly. The intent is to be smaller and boot
-faster. Currently it is pretty hardcoded for the needs of qm, and is
-not flexible enough for any kind of generic use.
+qmc is an experimental podman-less launcher for the qm container,
+using crun directly. The intent is to be smaller and boot faster. It
+is hardcoded for the needs of qm, and is not flexible enough for any
+kind of generic use.
 
+The goal of this work is to eventually be inserted into the main
+qm module, replacing the quadlet qm.container with qmc.service.
+Additionally the "qmc" binary on the host replaces various things
+in qm, like "podman exec qm", and "qmctl". Also, the more flexible
+config drop-ins for qmc is intended to be good enough to replace
+all use of quadlet dropins as well as the oci hooks currently used
+by qm.
 
 Build and install:
 
@@ -19,7 +26,9 @@ sudo systemctl daemon-reload
 ```
 
 The installed `qmc.service` sits alongside the existing `qm.service`,
-so that this can install in parallel with the regular qm quadlet.
+so that this can install in parallel with the regular qm
+quadlet. (Although this is just during testing, eventually qm.service
+will go way once this is merged into qm.)
 
 The defaults use `qm` as hostname and OCI container ID and `/run/qm`
 for runtime files. When set, `RUNTIME_DIRECTORY` supplies the runtime path;
