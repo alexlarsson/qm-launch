@@ -166,9 +166,7 @@ static void parse_hostname(void *field, json_object *value, const char *name,
 {
 	const char *string = config_string(value, name, filename);
 	if (!*string || strlen(string) > 64 ||
-	    strspn(string, "abcdefghijklmnopqrstuvwxyz"
-			   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-			   "0123456789.-") != strlen(string))
+	    !string_in_class(string, CHAR_ALNUM | CHAR_DOT | CHAR_DASH))
 		errx(1, "%s: invalid hostname", filename);
 
 	replace_string(field, xstrdup(string));
@@ -179,9 +177,7 @@ static void parse_seat(void *field, json_object *value, const char *name,
 {
 	const char *string = config_string(value, name, filename);
 	if (!starts_with(string, "seat") || !string[4] || strlen(string) > 255 ||
-	    strspn(string, "abcdefghijklmnopqrstuvwxyz"
-			   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-			   "0123456789-_") != strlen(string))
+	    !string_in_class(string, CHAR_ALNUM | CHAR_DASH | CHAR_UNDERSCORE))
 		errx(1, "%s: %s is not a valid seat name", filename, name);
 
 	replace_string(field, xstrdup(string));
@@ -410,6 +406,7 @@ bool reserved_mount_destination(const char *destination)
 	const char *const reserved[] = {"/",
 					"/run/.containerenv",
 					"/run/secrets",
+					"/run/host/qmc-signals",
 					"/etc/hostname",
 					"/etc/resolv.conf",
 					"/etc/hosts"};

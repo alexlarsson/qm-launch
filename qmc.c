@@ -13,12 +13,14 @@
 #include "qm-state.h"
 #include "qm-utils.h"
 
+#include <dirent.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <json-c/json.h>
 #include <json-c/json_pointer.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -45,6 +47,7 @@ typedef enum {
 	COMMAND_LAUNCH,
 	COMMAND_EXEC,
 	COMMAND_INSPECT,
+	COMMAND_SIGNAL,
 	COMMAND_CLEANUP,
 	COMMAND_UPDATE_RESOLV_CONF,
 } Command;
@@ -55,6 +58,8 @@ static bool opt_verbose;
 static bool opt_prepare_only;
 static bool opt_inspect_oci;
 static const char *opt_inspect_field;
+static const char *opt_signal_name;
+static bool opt_clear_signal;
 static char **opt_exec_argv; /* Borrowed from main's argv, NULL-terminated. */
 
 static void debug(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -191,7 +196,7 @@ static int cleanup(const char *runtime_dir)
 	if (!result && state->bundle) {
 		debug("Removing runtime bundle contents in %s", state->bundle);
 		/* systemd may own this directory and its label/mode. Keep it intact. */
-		result |= remove_tree_contents(state->bundle);
+		result |= remove_tree_contents_except(state->bundle, "signals");
 	}
 	if (!result && unlink(state_file) < 0 && errno != ENOENT) {
 		warn("remove %s", state_file);
@@ -474,7 +479,7 @@ static void configure_machine_id(json_object *process)
 
 	autofree char *id = read_text_file("/etc/machine-id");
 	id[strcspn(id, "\r\n")] = '\0';
-	if (strlen(id) != 32 || strspn(id, "0123456789abcdefABCDEF") != 32 ||
+	if (strlen(id) != 32 || !string_in_class(id, CHAR_HEX) ||
 	    strspn(id, "0") == 32) {
 		warnx("invalid host machine ID in /etc/machine-id; "
 		      "leaving container machine ID selection to systemd");
@@ -529,6 +534,9 @@ static void configure_mounts(json_object *config, const char *files)
 		autofree char *source = join_path(files, sources[i].filename);
 		override_mount_source(config, sources[i].destination, source);
 	}
+
+	autofree char *signals = join_path(opt_runtime_dir, "signals");
+	override_mount_source(config, "/run/host/qmc-signals", signals);
 }
 
 static void configure_seccomp(json_object *linux_config, json_object *process,
@@ -754,12 +762,115 @@ static int update_resolv_conf(const Config *configuration)
 	return 0;
 }
 
+static int open_signals_directory(const char *path, bool create)
+{
+	if (create && mkdir(path, 0755) < 0 && errno != EEXIST)
+		err(1, "mkdir %s", path);
+
+	int fd = TEMP_FAILURE_RETRY(
+		open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+	if (fd < 0) {
+		if (!create && errno == ENOENT)
+			return -1;
+		err(1, "open directory %s", path);
+	}
+	if (TEMP_FAILURE_RETRY(flock(fd, LOCK_EX)) < 0)
+		err(1, "lock directory %s", path);
+
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		err(1, "stat %s", path);
+	if (st.st_uid != geteuid() || (st.st_mode & 0022))
+		errx(1,
+		     "%s must be a directory owned and writable only by the current user",
+		     path);
+
+	/* A mapped container root must be able to search the read-only bind. */
+	if (create && fchmod(fd, 0755) < 0)
+		err(1, "chmod %s", path);
+	return fd;
+}
+
+static int signal_container(void)
+{
+	if (!opt_clear_signal)
+		ensure_private_directory(opt_runtime_dir);
+	autofree char *directory = join_path(opt_runtime_dir, "signals");
+	autoclose int directory_fd = open_signals_directory(directory, !opt_clear_signal);
+	if (directory_fd < 0)
+		return 0;
+
+	autofree char *filename = join_path(directory, opt_signal_name);
+	if (opt_clear_signal) {
+		if (unlink(filename) < 0 && errno != ENOENT)
+			err(1, "clear signal %s", opt_signal_name);
+		return 0;
+	}
+
+	struct stat st;
+	if (lstat(filename, &st) == 0) {
+		if (!S_ISREG(st.st_mode))
+			errx(1, "%s is not a regular signal file", filename);
+		return 0;
+	}
+	if (errno != ENOENT)
+		err(1, "stat %s", filename);
+
+	/* Publish a fully labelled marker without replacing an existing one. */
+	autofree char *temporary = join_path(directory, ".signal-XXXXXX");
+	autoclose int fd = mkostemp(temporary, O_CLOEXEC);
+	if (fd < 0)
+		err(1, "create signal %s", opt_signal_name);
+	if (fchmod(fd, 0644) < 0)
+		err(1, "chmod %s", temporary);
+	autofree char *context = get_selinux_label(directory);
+	set_selinux_label(temporary, context);
+
+	if (link(temporary, filename) < 0 && errno != EEXIST) {
+		int saved_errno = errno;
+		unlink(temporary);
+		errno = saved_errno;
+		err(1, "set signal %s", opt_signal_name);
+	}
+	if (unlink(temporary) < 0)
+		err(1, "remove temporary signal %s", temporary);
+	return 0;
+}
+
+static void label_signals(const char *path, const char *context)
+{
+	set_selinux_label(path, context);
+	if (!context || !*context)
+		return;
+
+	DIR *directory = opendir(path);
+	if (!directory)
+		err(1, "open directory %s", path);
+	struct dirent *entry;
+	errno = 0;
+	while ((entry = readdir(directory))) {
+		if (entry->d_name[0] != '.') {
+			autofree char *filename = join_path(path, entry->d_name);
+			set_selinux_label(filename, context);
+		}
+		errno = 0;
+	}
+	if (errno)
+		err(1, "read directory %s", path);
+	if (closedir(directory) < 0)
+		err(1, "close directory %s", path);
+}
+
 static void write_container_files(const Config *configuration, json_object *config)
 {
 	const char *context =
 		opt_prepare_only ? NULL
 				 : json_object_get_string(
 					   js_get(js_get(config, "linux"), "mountLabel"));
+
+	autofree char *signals = join_path(opt_runtime_dir, "signals");
+	autoclose int signals_fd = open_signals_directory(signals, true);
+	label_signals(signals, context);
 
 	autofree char *files = join_path(opt_runtime_dir, "files");
 	ensure_private_directory(files);
@@ -868,6 +979,7 @@ enum {
 	OPTION_OCI = 1 << 4,
 	OPTION_FIELD = 1 << 5,
 	OPTION_HELP = 1 << 6,
+	OPTION_CLEAR = 1 << 7,
 
 	COMMON_OPTIONS = OPTION_RUNTIME_DIR | OPTION_VERBOSE | OPTION_HELP,
 };
@@ -899,6 +1011,9 @@ static const OptionInfo options[] = {
 	 "Print one field, as a key or JSON pointer\n"
 	 "                        Strings are printed without quotes"},
 	{{"help", no_argument, NULL, OPTION_HELP}, NULL, "Show this help"},
+	{{"clear", no_argument, NULL, OPTION_CLEAR},
+	 NULL,
+	 "Clear a previously set signal"},
 };
 
 typedef struct {
@@ -924,6 +1039,13 @@ static const CommandInfo commands[] = {
 		.arguments = "",
 		.description = "Show merged settings or saved OCI configuration",
 		.options = COMMON_OPTIONS | OPTION_CONFIG | OPTION_OCI | OPTION_FIELD,
+	},
+	{
+		.command = COMMAND_SIGNAL,
+		.name = "signal",
+		.arguments = " NAME",
+		.description = "Set or clear a persistent host signal for QM",
+		.options = COMMON_OPTIONS | OPTION_CLEAR,
 	},
 	{
 		.command = COMMAND_LAUNCH,
@@ -1032,6 +1154,9 @@ static void parse_command_options(const CommandInfo *command, int argc, char **a
 		case OPTION_FIELD:
 			opt_inspect_field = optarg;
 			break;
+		case OPTION_CLEAR:
+			opt_clear_signal = true;
+			break;
 		case OPTION_HELP:
 			command_usage(stdout, command);
 			exit(0);
@@ -1049,6 +1174,16 @@ static void parse_command_options(const CommandInfo *command, int argc, char **a
 		opt_exec_argv = argv + optind;
 		if (!opt_exec_argv[0] || !*opt_exec_argv[0])
 			errx(2, "exec requires a command");
+	} else if (command->command == COMMAND_SIGNAL) {
+		if (argc - optind != 1)
+			errx(2, "signal requires exactly one name");
+		opt_signal_name = argv[optind];
+
+		if (!char_in_class(*opt_signal_name, CHAR_ALNUM) ||
+		    strlen(opt_signal_name) > NAME_MAX ||
+		    !string_in_class(opt_signal_name,
+				     CHAR_ALNUM | CHAR_UNDERSCORE | CHAR_DOT | CHAR_DASH))
+			errx(2, "invalid signal name: %s", opt_signal_name);
 	} else if (optind != argc) {
 		errx(2, "%s takes no positional arguments", command->name);
 	}
@@ -1086,6 +1221,8 @@ int main(int argc, char **argv)
 		return exec_in_container();
 	if (command == COMMAND_CLEANUP)
 		return cleanup(opt_runtime_dir);
+	if (command == COMMAND_SIGNAL)
+		return signal_container();
 	if (command == COMMAND_INSPECT && opt_inspect_oci)
 		return inspect(NULL);
 

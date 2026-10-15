@@ -27,7 +27,7 @@ systemd sets it from the service's `RuntimeDirectory` setting. `--runtime-dir`
 overrides that path. The launcher sets up QM networking using the configured
 IPv4 addresses.
 Use `qmc exec` to run a command inside QM and `qmc inspect` to examine its
-configuration.
+configuration. `qmc signal` publishes host state for services inside QM.
 The service uses the internal `launch` and `cleanup` commands to manage QM's
 lifetime, and `update-resolv-conf` to refresh its DNS and hosts files.
 These commands are hidden from the top-level help. Each command's `--help`
@@ -300,6 +300,45 @@ and `--verbose`. Read service output with
 `journalctl -b -u qmc.service --no-pager`. For command debugging, use
 `qmc exec --verbose COMMAND`.
 
+Host services can publish named signals independently of container startup:
+
+```sh
+qmc signal network-ready
+qmc signal --clear network-ready
+```
+
+Signals are empty files in `/run/qm/signals`. The supplied OCI base binds this
+directory read-only at `/run/host/qmc-signals` inside QM. The command accepts
+`--runtime-dir` and `RUNTIME_DIRECTORY` as for launch, and does not read launch
+configuration or require a running container. Names start with an ASCII letter
+or digit and contain only ASCII letters, digits, `.`, `_` and `-`.
+Setting and clearing signals are idempotent. Signals survive launch, cleanup,
+service stops and container restarts until explicitly cleared; a host reboot
+clears them. The directory inode stays the same so existing bind mounts and
+inotify watches continue to see changes.
+
+For example, a host service ordered after the host's `network-online.target`
+could set `network-ready`. A `.path` unit in the QM rootfs could activate an
+existing container service:
+
+```ini
+[Path]
+PathExists=/run/host/qmc-signals/network-ready
+Unit=network-dependent.service
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`PathExists=` checks the initial state too, so a signal published before QM
+starts is observed. A oneshot service triggered this way should use
+`RemainAfterExit=yes` to avoid repeated activation while the marker exists.
+Starting a `.path` unit does not wait for the marker; gating
+`network-online.target` requires a wait service in the QM rootfs.
+See [systemd.path](https://github.com/systemd/systemd/blob/main/man/systemd.path.xml).
+The host publisher and container services are configured by the QM rootfs;
+qmc supplies the generic signal transport.
+
 The supplied OCI configuration enables a pseudo-terminal for QM's
 `/dev/console`. Crun hands its master descriptor to a launcher child, which
 copies console output to the launcher's stdout, captured by the service journal.
@@ -460,9 +499,10 @@ and the network interface names, nftables table and owner. Cleanup uses only
 this recorded state; startup options and current network defaults are not
 needed. A failed
 cleanup retains the state for a retry. Successful cleanup removes the recorded
-bundle contents recursively, including crun caches and the state file. It leaves
+bundle contents recursively, including crun caches and the state file, preserving
+the `signals` directory and its markers. It leaves
 the runtime directory itself intact, preserving systemd's ownership, mode and
-SELinux label. This also applies to manual launches; remove the empty directory
+SELinux label. This also applies to manual launches; remove the directory
 separately if desired.
 Missing resources count as already cleaned up.
 Normal startup retries cleanup before writing a new bundle, warns if cleanup

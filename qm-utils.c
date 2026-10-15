@@ -10,7 +10,7 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <ftw.h>
+#include <fts.h>
 #include <linux/magic.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -131,6 +131,30 @@ char *join_path(const char *a, const char *b)
 	return xasprintf("%s%s%s", a, *a && a[strlen(a) - 1] != '/' ? "/" : "", b);
 }
 
+bool char_in_class(unsigned char character, CharClass classes)
+{
+	return ((classes & CHAR_ALPHA) &&
+		((character >= 'a' && character <= 'z') ||
+		 (character >= 'A' && character <= 'Z'))) ||
+	       ((classes & (CHAR_DIGIT | CHAR_HEX)) &&
+		character >= '0' && character <= '9') ||
+	       ((classes & CHAR_HEX) &&
+		((character >= 'a' && character <= 'f') ||
+		 (character >= 'A' && character <= 'F'))) ||
+	       ((classes & CHAR_DOT) && character == '.') ||
+	       ((classes & CHAR_DASH) && character == '-') ||
+	       ((classes & CHAR_UNDERSCORE) && character == '_');
+}
+
+bool string_in_class(const char *string, CharClass classes)
+{
+	for (; *string; string++)
+		if (!char_in_class(*string, classes))
+			return false;
+
+	return true;
+}
+
 char *canonicalize_path(const char *path)
 {
 	if (*path != '/') {
@@ -179,7 +203,7 @@ bool parse_size(const char *string, int64_t *size)
 	}
 
 	/* strtoull accepts signs and leading whitespace; sizes do not. */
-	if (*string < '0' || *string > '9')
+	if (!char_in_class(*string, CHAR_DIGIT))
 		return false;
 
 	errno = 0;
@@ -468,25 +492,67 @@ void write_text_file(const char *name, const char *contents)
 	write_all(fd, contents, strlen(contents));
 }
 
-static int remove_tree_entry(const char *path, const struct stat *st, int type,
-			     struct FTW *ftw)
+int remove_tree_contents_except(const char *path, const char *preserve)
 {
-	(void)st;
-	(void)type;
-	/* Preserve the top-level directory, including its ownership and label. */
-	if (ftw->level == 0)
-		return 0;
-	return remove(path) == 0 || errno == ENOENT ? 0 : -1;
+	char *paths[] = {(char *)path, NULL};
+	FTS *tree = fts_open(paths, FTS_NOCHDIR | FTS_PHYSICAL | FTS_XDEV, NULL);
+	if (!tree) {
+		warn("remove %s", path);
+		return 1;
+	}
+
+	int result = 0;
+	FTSENT *entry;
+	errno = 0;
+	while ((entry = fts_read(tree))) {
+		if (entry->fts_info == FTS_ERR || entry->fts_info == FTS_DNR ||
+		    entry->fts_info == FTS_NS) {
+			if (entry->fts_errno != ENOENT) {
+				errno = entry->fts_errno;
+				warn("remove %s", entry->fts_path);
+				result = 1;
+			}
+		} else if (entry->fts_level == 1 && preserve &&
+			   !strcmp(entry->fts_name, preserve)) {
+			fts_set(tree, entry, FTS_SKIP);
+		} else if (entry->fts_level > 0 && entry->fts_info != FTS_D &&
+			   remove(entry->fts_accpath) < 0 && errno != ENOENT) {
+			warn("remove %s", entry->fts_path);
+			result = 1;
+		}
+		errno = 0;
+	}
+	if (errno) {
+		warn("read directory %s", path);
+		result = 1;
+	}
+	if (fts_close(tree) < 0) {
+		warn("close directory %s", path);
+		result = 1;
+	}
+	return result;
 }
 
 int remove_tree_contents(const char *path)
 {
-	if (nftw(path, remove_tree_entry, 16, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) < 0 &&
-	    errno != ENOENT) {
-		warn("remove %s", path);
-		return 1;
-	}
-	return 0;
+	return remove_tree_contents_except(path, NULL);
+}
+
+char *get_selinux_label(const char *name)
+{
+	if (access("/sys/fs/selinux/enforce", F_OK) < 0)
+		return NULL;
+
+	ssize_t size = getxattr(name, "security.selinux", NULL, 0);
+	if (size < 0)
+		err(1, "read label %s", name);
+
+	autofree char *context = xmalloc(size + 1);
+	ssize_t length = getxattr(name, "security.selinux", context, size);
+	if (length < 0)
+		err(1, "read label %s", name);
+	context[length] = '\0';
+	return steal_ptr(&context);
 }
 
 void set_selinux_label(const char *name, const char *context)

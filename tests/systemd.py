@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent
 LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
@@ -42,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
     units = etc / "systemd/system"
     units.mkdir(parents=True)
     (units / "qm-test.target").write_text(
-        "[Unit]\nDefaultDependencies=no\nRequires=qm-test-ready.service\n"
+        "[Unit]\nDefaultDependencies=no\nRequires=qm-test-ready.service qm-test-signal.path\n"
         "After=qm-test-ready.service\n")
     # Readiness here uses PID 1's /run/systemd/notify, distinct from crun's proxy.
     (units / "qm-test-ready.service").write_text(
@@ -50,6 +51,12 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
         "NotifyAccess=all\nRemainAfterExit=yes\n"
         "ExecStart=/usr/bin/systemd-notify --ready\n"
         "StandardOutput=null\nStandardError=null\n")
+    (units / "qm-test-signal.path").write_text(
+        "[Unit]\nDefaultDependencies=no\n[Path]\n"
+        "PathExists=/run/host/qmc-signals/network-ready\n")
+    (units / "qm-test-signal.service").write_text(
+        "[Unit]\nDefaultDependencies=no\n[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+        "ExecStart=/usr/bin/touch /run/signal-received\n")
 
     config = json.loads((SOURCE / "qm.json").read_text())
     config["root"]["path"] = str(root)
@@ -77,6 +84,12 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
                                   "mounts": [{"source": str(etc), "destination": "/etc"}],
                                   "seccomp": str(SOURCE / "tests/seccomp-no-rt.json")}))
     runtime = directory / "runtime"
+    signal_command = [str(LAUNCHER), "signal", "--runtime-dir", str(runtime)]
+    subprocess.run([*signal_command, "persistent"], check=True)
+    persistent_inode = (runtime / "signals/persistent").stat().st_ino
+    signal_before_startup = MACHINE_ID_STATE == "existing"
+    if signal_before_startup:
+        subprocess.run([*signal_command, "network-ready"], check=True)
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify, \
             (directory / "console.log").open("w+") as log:
@@ -101,6 +114,28 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
                  "/usr/bin/systemctl", "is-active", "qm-test-ready.service"],
                 text=True, capture_output=True, timeout=5)
             assert result.returncode == 0 and result.stdout == "active\n", result
+
+            def exec_in_qm(*command):
+                return subprocess.run(
+                    [str(LAUNCHER), "exec", "--runtime-dir", str(runtime), *command],
+                    text=True, capture_output=True, timeout=5)
+
+            if not signal_before_startup:
+                result = exec_in_qm("/usr/bin/test", "-e", "/run/signal-received")
+                assert result.returncode == 1, result
+                subprocess.run([*signal_command, "network-ready"], check=True)
+            deadline = time.monotonic() + 5
+            while True:
+                result = exec_in_qm("/usr/bin/test", "-e", "/run/signal-received")
+                if result.returncode == 0:
+                    break
+                assert time.monotonic() < deadline, result
+                time.sleep(0.01)
+            result = exec_in_qm("/usr/bin/touch", "/run/host/qmc-signals/guest")
+            assert result.returncode != 0 and "Read-only file system" in result.stderr, result
+            subprocess.run([*signal_command, "--clear", "network-ready"], check=True)
+            result = exec_in_qm("/usr/bin/test", "!", "-e", "/run/host/qmc-signals/network-ready")
+            assert result.returncode == 0, result
             result = subprocess.run(
                 [str(LAUNCHER), "exec", "--runtime-dir", str(runtime),
                  "/usr/bin/cat", "/etc/machine-id"],
@@ -134,6 +169,8 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
             assert "running in system mode" in log.read(), "missing early systemd console output"
             print("Systemd PID 1 inherits the host machine ID, handles machine-id commit "
                   f"({MACHINE_ID_STATE}), accepts service notifications and forwards readiness", flush=True)
+            print("Read-only host signals activate a .path service "
+                  f"({'before' if signal_before_startup else 'after'} container startup)", flush=True)
         except BaseException:
             log.seek(0)
             print(log.read()[-8000:], file=sys.stderr)
@@ -143,4 +180,5 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
                 process.kill()
                 process.wait(timeout=5)
             subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(runtime)], check=True)
-        assert runtime.is_dir() and list(runtime.iterdir()) == []
+        assert runtime.is_dir() and list(runtime.iterdir()) == [runtime / "signals"]
+        assert (runtime / "signals/persistent").stat().st_ino == persistent_inode

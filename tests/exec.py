@@ -111,7 +111,7 @@ class ExecTests(unittest.TestCase):
     def test_help_and_missing_command(self):
         result = subprocess.run([str(LAUNCHER), "--help"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ("exec", "inspect"):
+        for command in ("exec", "inspect", "signal"):
             self.assertIn(f"\n  {command} ", result.stdout)
         for internal in ("launch", "cleanup", "update-resolv-conf"):
             self.assertNotIn(internal, result.stdout)
@@ -127,6 +127,7 @@ class ExecTests(unittest.TestCase):
         commands = {
             "exec": set(),
             "inspect": {"--config", "--oci", "--field"},
+            "signal": {"--clear"},
             "launch": {"--config", "--prepare-only"},
             "cleanup": set(),
             "update-resolv-conf": {"--config"},
@@ -149,6 +150,7 @@ class ExecTests(unittest.TestCase):
         cases = {
             "exec": ["--config", "--prepare-only", "--oci", "--field"],
             "inspect": ["--prepare-only"],
+            "signal": ["--config", "--prepare-only", "--oci", "--field"],
             "launch": ["--oci", "--field"],
             "cleanup": ["--config", "--prepare-only", "--oci", "--field"],
             "update-resolv-conf": ["--prepare-only", "--oci", "--field"],

@@ -408,7 +408,7 @@ class ConfigTests(unittest.TestCase):
         cases += [{"mounts": [{"source": "/host", "destination": dest}]}
                   for dest in ["/", "//", "/etc/hosts", "/etc//hosts", "/etc/./hosts",
                                "/tmp/../etc/hosts", "/etc/hosts/", "/tmp/..",
-                               "/etc/a/../../run/secrets/."]]
+                               "/etc/a/../../run/secrets/.", "/run/host/qmc-signals"]]
         path = self.write(self.vendor, "qmc.conf.d/10-invalid.conf", {})
         for settings in cases:
             with self.subTest(settings=settings):

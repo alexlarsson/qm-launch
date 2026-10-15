@@ -151,6 +151,18 @@
       ]
     },
     {
+      "destination": "/run/host/qmc-signals",
+      "type": "bind",
+      "options": [
+        "rbind",
+        "rprivate",
+        "ro",
+        "nosuid",
+        "noexec",
+        "nodev"
+      ]
+    },
+    {
       "destination": "/etc/hostname",
       "type": "bind",
       "options": [

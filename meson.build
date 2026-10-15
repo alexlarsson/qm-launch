@@ -69,6 +69,7 @@ if python.found()
     meson.current_source_dir(), '/payload'])
   test('exec', python, args: [files('tests/exec.py'), launcher])
   test('inspect', python, args: [files('tests/inspection.py'), launcher])
+  test('signals', python, args: [files('tests/signals.py'), launcher])
 endif
 
 utils_test = executable('test-utils', ['tests/utils.c', 'qm-utils.c'],

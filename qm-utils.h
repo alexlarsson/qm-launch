@@ -77,6 +77,22 @@ void ptr_array_clear(PtrArray *array, void (*free_func)(void *));
 bool starts_with(const char *string, const char *prefix);
 char *join_path(const char *a, const char *b);
 
+typedef enum {
+	CHAR_ALPHA = 1 << 0,
+	CHAR_DIGIT = 1 << 1,
+	CHAR_HEX = 1 << 2,
+	CHAR_DOT = 1 << 3,
+	CHAR_DASH = 1 << 4,
+	CHAR_UNDERSCORE = 1 << 5,
+	CHAR_ALNUM = CHAR_ALPHA | CHAR_DIGIT,
+} CharClass;
+
+/* Match any selected ASCII character class, independently of locale.
+ * NUL and non-ASCII bytes never match. The string helper accepts empty strings.
+ */
+bool char_in_class(unsigned char character, CharClass classes);
+bool string_in_class(const char *string, CharClass classes);
+
 /* Return an allocated absolute path with repeated slashes, . and .. resolved
  * lexically, without filesystem I/O or following symlinks. Relative paths
  * return NULL with errno set to EINVAL; .. at the root stays at the root.
@@ -100,11 +116,15 @@ void write_text_file(const char *name, const char *contents);
  * Missing paths succeed; return 1 and report other errors on stderr.
  */
 int remove_tree_contents(const char *path);
+/* Preserve one named entry directly inside path, including its contents. */
+int remove_tree_contents_except(const char *path, const char *preserve);
 /* Write a slash-separated key under /proc/sys; optional ignores missing keys.
  * Return 0 on success, -1 on failure and report errors on stderr.
  */
 int sysctl_write(const char *key, const char *value, bool optional);
 void set_selinux_label(const char *name, const char *context);
+/* Return an allocated label, or NULL when SELinux is disabled. */
+char *get_selinux_label(const char *name);
 
 typedef struct {
 	bool found;

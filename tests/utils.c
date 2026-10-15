@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -88,6 +89,58 @@ pid_t __wrap_fork(void)
 	return __real_fork();
 }
 
+static void test_character_classes(void)
+{
+	const struct {
+		CharClass classes;
+		const char *characters;
+	} classes[] = {
+		{CHAR_ALPHA, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+		{CHAR_DIGIT, "0123456789"},
+		{CHAR_HEX, "0123456789abcdefABCDEF"},
+		{CHAR_DOT, "."},
+		{CHAR_DASH, "-"},
+		{CHAR_UNDERSCORE, "_"},
+		{CHAR_ALNUM, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(classes); i++) {
+		for (unsigned c = 0; c <= UCHAR_MAX; c++) {
+			bool expected = c && strchr(classes[i].characters, c);
+			assert(char_in_class(c, classes[i].classes) == expected);
+
+			char string[] = {(char)c, '\0'};
+			assert(string_in_class(string, classes[i].classes) ==
+			       (!c || expected));
+		}
+	}
+
+	const struct {
+		const char *string;
+		CharClass classes;
+		bool expected;
+	} strings[] = {
+		{"", 0, true},
+		{"", CHAR_ALNUM, true},
+		{"a", 0, false},
+		{"QM09", CHAR_ALNUM, true},
+		{"QM09", CHAR_ALPHA, false},
+		{"qmc-test_0.conf", CHAR_ALNUM | CHAR_DASH | CHAR_UNDERSCORE | CHAR_DOT, true},
+		{"qmc-test_0.conf", CHAR_ALNUM | CHAR_DASH | CHAR_UNDERSCORE, false},
+		{"09aF-fA90", CHAR_HEX | CHAR_DASH, true},
+		{"09aF-gA90", CHAR_HEX | CHAR_DASH, false},
+		{"9.0", CHAR_DIGIT | CHAR_DOT, true},
+		{"a/b", CHAR_ALNUM | CHAR_DOT | CHAR_DASH | CHAR_UNDERSCORE, false},
+		{"a b", CHAR_ALNUM, false},
+		{"a\nb", CHAR_ALNUM, false},
+		{"caf\xc3\xa9", CHAR_ALNUM, false},
+	};
+
+	for (size_t i = 0; i < N_ELEMENTS(strings); i++)
+		assert(string_in_class(strings[i].string, strings[i].classes) ==
+		       strings[i].expected);
+}
+
 static void test_canonicalize_path(void)
 {
 	const struct {
@@ -159,10 +212,39 @@ static void test_ptr_array(void)
 	assert(array.items == NULL && array.length == 0 && array.capacity == 0);
 }
 
+static void test_remove_tree_contents_except(void)
+{
+	char path[] = "/tmp/qm-utils-tree-XXXXXX";
+	assert(mkdtemp(path));
+	autofree char *preserved = join_path(path, "keep");
+	autofree char *marker = join_path(preserved, "marker");
+	autofree char *discarded = join_path(path, "discard");
+	autofree char *nested = join_path(discarded, "keep");
+	assert(mkdir(preserved, 0700) == 0);
+	write_text_file(marker, "keep\n");
+	assert(mkdir(discarded, 0700) == 0);
+	write_text_file(nested, "remove\n");
+	autofree char *link = join_path(discarded, "link");
+	assert(symlink(preserved, link) == 0);
+	struct stat before, after;
+	assert(stat(preserved, &before) == 0);
+	assert(remove_tree_contents_except(path, "keep") == 0);
+	assert(stat(preserved, &after) == 0 && before.st_ino == after.st_ino);
+	autofree char *contents = read_text_file(marker);
+	assert(!strcmp(contents, "keep\n"));
+	assert(access(discarded, F_OK) < 0 && errno == ENOENT);
+	assert(remove_tree_contents(path) == 0);
+	assert(access(preserved, F_OK) < 0 && errno == ENOENT);
+	assert(rmdir(path) == 0);
+	assert(remove_tree_contents_except(path, "keep") == 0);
+}
+
 int main(void)
 {
+	test_character_classes();
 	test_canonicalize_path();
 	test_ptr_array();
+	test_remove_tree_contents_except();
 
 	int64_t size;
 	assert(parse_size("5GiB", &size) && size == INT64_C(5) * 1024 * 1024 * 1024);

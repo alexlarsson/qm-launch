@@ -169,6 +169,10 @@ class PrepareTests(unittest.TestCase):
         self.assertIn("size=65536k", mounts["/dev/shm"]["options"])
         for destination in ("/etc/hosts", "/etc/hostname", "/etc/resolv.conf", "/run/.containerenv", "/run/secrets"):
             self.assertTrue(pathlib.Path(mounts[destination]["source"]).exists())
+        signals = mounts["/run/host/qmc-signals"]
+        self.assertEqual(signals["source"], str(self.runtime / "signals"))
+        self.assertIn("ro", signals["options"])
+        self.assertEqual(stat.S_IMODE((self.runtime / "signals").stat().st_mode), 0o755)
         self.assertEqual((self.runtime / "files/hostname").read_text(), "qm-test\n")
         self.assertEqual((self.runtime / "files/resolv.conf").read_text(), self.resolv.read_text())
         self.assertIn("10.90.0.2\tqm-test qm\n", (self.runtime / "files/hosts").read_text())
@@ -1146,7 +1150,7 @@ class PrepareTests(unittest.TestCase):
         self.assertIn(f"read {missing_config}", result.stderr)
         self.assertFalse(state.exists())
         self.assertTrue(self.runtime.is_dir())
-        self.assertEqual(list(self.runtime.iterdir()), [])
+        self.assertEqual(list(self.runtime.iterdir()), [self.runtime / "signals"])
 
     def test_successful_cleanup_preserves_runtime_directory_metadata(self):
         result = self.prepare()
@@ -1162,7 +1166,7 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.runtime.stat().st_ino, original.st_ino)
             self.assertEqual(self.runtime.stat().st_mode, original.st_mode)
-            self.assertEqual(list(self.runtime.iterdir()), [])
+            self.assertEqual(list(self.runtime.iterdir()), [self.runtime / "signals"])
 
     def test_cleanup_removes_bundle_without_following_symlinks(self):
         result = self.prepare()
@@ -1187,8 +1191,30 @@ class PrepareTests(unittest.TestCase):
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.runtime.is_dir())
-        self.assertEqual(list(self.runtime.iterdir()), [])
+        self.assertEqual(list(self.runtime.iterdir()), [self.runtime / "signals"])
         self.assertEqual(target.read_text(), "outside the bundle\n")
+
+    def test_signals_survive_preparation_cleanup_and_restart(self):
+        command = [str(LAUNCHER), "signal", "--runtime-dir", str(self.runtime)]
+        result = subprocess.run([*command, "network-ready"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        signal = self.runtime / "signals/network-ready"
+        original = signal.stat()
+        for _ in range(2):
+            result = self.prepare()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(signal.stat().st_ino, original.st_ino)
+            (self.runtime / "state.json").write_text(json.dumps({
+                "version": 1, "bundle": str(self.runtime)}))
+            result = subprocess.run([str(LAUNCHER), "cleanup", "--runtime-dir", str(self.runtime)],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(list(self.runtime.iterdir()), [signal.parent])
+            self.assertEqual(signal.stat().st_ino, original.st_ino)
+        result = subprocess.run([*command, "--clear", "network-ready"],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(signal.exists())
 
     def test_prepare_preserves_existing_cleanup_state(self):
         result = self.prepare()

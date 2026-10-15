@@ -503,19 +503,15 @@ static char *network_owner(const char *runtime_dir)
 
 static bool valid_interface(const char *name)
 {
-	const char *characters = "abcdefghijklmnopqrstuvwxyz"
-				 "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-";
 	return name && *name && strlen(name) < IFNAMSIZ &&
-	       strspn(name, characters) == strlen(name);
+	       string_in_class(name, CHAR_ALNUM | CHAR_UNDERSCORE | CHAR_DOT | CHAR_DASH);
 }
 
 static bool valid_table(const char *name)
 {
-	const char *characters = "abcdefghijklmnopqrstuvwxyz"
-				 "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-";
 	return name && *name && strlen(name) < NFT_TABLE_MAXNAMELEN &&
-	       strspn(name, characters) == strlen(name) &&
-	       !(*name >= '0' && *name <= '9') && *name != '.' && *name != '-';
+	       char_in_class(*name, CHAR_ALPHA | CHAR_UNDERSCORE) &&
+	       string_in_class(name, CHAR_ALNUM | CHAR_UNDERSCORE | CHAR_DOT | CHAR_DASH);
 }
 
 /* Keep names within rtnetlink's bounds and safe as nftables identifiers. */

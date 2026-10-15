@@ -322,7 +322,9 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         assert not (runtime / "netns").exists()
         assert not (runtime / "state.json").exists()
         assert runtime.is_dir()
-        assert list(runtime.iterdir()) == []
+        assert set(runtime.iterdir()) <= {runtime / "signals"}
+        if (runtime / "signals").exists():
+            assert list((runtime / "signals").iterdir()) == []
 
     def assert_masquerading(*command):
         listener = subprocess.Popen(
