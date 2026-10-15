@@ -5,6 +5,7 @@
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,19 @@ class PrepareTests(unittest.TestCase):
 
     def generated(self):
         return json.loads((self.runtime / "config.json").read_text())
+
+    def assert_device(self, config, destination, source):
+        info = os.stat(source)
+        expected = {"path": destination, "type": "c" if stat.S_ISCHR(info.st_mode) else "b",
+                    "major": os.major(info.st_rdev), "minor": os.minor(info.st_rdev),
+                    "fileMode": stat.S_IMODE(info.st_mode), "uid": info.st_uid,
+                    "gid": info.st_gid}
+        self.assertEqual([d for d in config["linux"]["devices"]
+                          if d["path"] == destination], [expected])
+        self.assertFalse(any(m["destination"] == destination for m in config["mounts"]))
+        self.assertIn({"allow": True, "type": expected["type"], "major": expected["major"],
+                       "minor": expected["minor"], "access": "rwm"},
+                      config["linux"]["resources"]["devices"])
 
     def test_static_config(self):
         result = self.prepare(hostname="qm-test")
@@ -287,13 +301,13 @@ class PrepareTests(unittest.TestCase):
             {"source": "/dev/zero", "destination": "/dev/test"},
             {"source": "/dev/null", "destination": "/dev/removed"},
             {"destination": "/dev/removed", "remove": True},
+            {"source": missing, "destination": "/dev/skipped"},
+            {"destination": "/dev/skipped", "remove": True},
             {"source": missing, "destination": "/dev/absent", "optional": True}]})
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.generated()
-        mounts = {m["destination"]: m for m in config["mounts"]}
-        self.assertEqual(mounts["/dev/test"]["source"], "/dev/zero")
-        self.assertNotIn("/dev/removed", mounts)
-        self.assertNotIn("/dev/absent", mounts)
+        self.assert_device(config, "/dev/test", "/dev/zero")
+        self.assertEqual([d["path"] for d in config["linux"]["devices"]], ["/dev/test"])
         self.assertEqual(config["linux"]["resources"]["devices"], [
             *self.base["linux"]["resources"]["devices"],
             {"allow": True, "type": "c", "major": 1, "minor": 5, "access": "rwm"}])
@@ -315,8 +329,77 @@ class PrepareTests(unittest.TestCase):
             {"destination": "/dev/b", "remove": True}]})
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.generated()["linux"]
-        self.assertEqual(config["devices"], [])
+        self.assertEqual([d["path"] for d in config["devices"]], ["/dev/c"])
         self.assertEqual(config["resources"]["devices"].count(rule), 1)
+
+    def test_device_globs_and_remapping(self):
+        for source, destination in [("/dev/nul?", None), ("/dev/[nz]*", "/dev/test")]:
+            with self.subTest(source=source):
+                operation = {"source": source}
+                if destination:
+                    operation["destination"] = destination
+                result = self.prepare(settings={"devices": [operation]})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.generated()
+                names = ["null", "zero"] if destination else ["null"]
+                self.assertEqual([d["path"] for d in config["linux"]["devices"]],
+                                 [f"{destination or '/dev'}/{name}" for name in names])
+                for name in names:
+                    self.assert_device(config, f"{destination or '/dev'}/{name}",
+                                       f"/dev/{name}")
+
+    def test_device_glob_overrides_and_removals(self):
+        result = self.prepare(settings={"devices": [
+            {"source": "/dev/[nz]*", "destination": "/dev/test"},
+            {"source": "/dev/zero", "destination": "/dev/test/null"},
+            {"destination": "/dev/test/zero", "remove": True}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()
+        self.assertEqual([d["path"] for d in config["linux"]["devices"]], ["/dev/test/null"])
+        self.assert_device(config, "/dev/test/null", "/dev/zero")
+        self.assertFalse(any(r.get("allow") and r.get("minor") == 3
+                             for r in config["linux"]["resources"]["devices"]))
+
+    def test_device_replaces_mount_and_preserves_metadata(self):
+        source = "/dev/null" if PRIVATE_PATHS else "/dev/tty"
+        self.base["mounts"].append({"destination": "/dev/test", "source": "tmpfs",
+                                    "type": "tmpfs", "options": []})
+        result = self.prepare(settings={"devices": [
+            {"source": source, "destination": "/dev/test"}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_device(self.generated(), "/dev/test", source)
+
+    def test_later_device_glob_restores_an_earlier_removed_match(self):
+        for earlier in ({"destination": "/dev/test/null", "remove": True},
+                        {"source": str(self.directory / "missing"),
+                         "destination": "/dev/test/null"}):
+            with self.subTest(earlier=earlier):
+                result = self.prepare(settings={"devices": [
+                    {"source": "/dev/nu*", "destination": "/dev/test"},
+                    earlier,
+                    {"source": "/dev/[nz]*", "destination": "/dev/test"}]})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.generated()
+                self.assert_device(config, "/dev/test/null", "/dev/null")
+                self.assert_device(config, "/dev/test/zero", "/dev/zero")
+
+    def test_empty_device_selections(self):
+        empty = self.directory / "empty"
+        empty.mkdir()
+        (empty / "file").touch()
+        (empty / "link").symlink_to("/dev/null")
+        (empty / "loop").symlink_to(empty)
+        for source in (str(empty), str(empty / "missing*"), str(empty / "fil*")):
+            for optional in (False, True):
+                with self.subTest(source=source, optional=optional):
+                    result = self.prepare(settings={"devices": [
+                        {"source": source, "destination": "/dev/test", "optional": optional}]})
+                    if optional:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertFalse(self.generated()["linux"].get("devices"))
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(source, result.stderr)
 
     def test_devices_and_mounts_share_destination_identity(self):
         self.base["mounts"].append({"destination": "/shared", "source": "tmpfs",
@@ -329,8 +412,10 @@ class PrepareTests(unittest.TestCase):
                              for m in self.generated()["mounts"]))
 
     def test_required_or_invalid_device_fails(self):
+        ordinary_file = self.directory / "file"
+        ordinary_file.touch()
         for source, optional in [(str(self.directory / "missing"), False),
-                                 (str(self.directory), True)]:
+                                 (str(ordinary_file), True)]:
             with self.subTest(source=source):
                 result = self.prepare(settings={"devices": [
                     {"source": source, "destination": "/dev/test", "optional": optional}]})
@@ -344,6 +429,66 @@ class PrepareTests(unittest.TestCase):
             {"source": str(loop), "destination": "/shared", "optional": True}]})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(str(loop), result.stderr)
+
+    def test_optional_devices_do_not_hide_other_lookup_errors(self):
+        loop = self.directory / "loop"
+        loop.symlink_to(loop)
+        for source in (str(loop), str(loop) + "*"):
+            with self.subTest(source=source):
+                result = self.prepare(settings={"devices": [
+                    {"source": source, "destination": "/dev/test", "optional": True}]})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(loop), result.stderr)
+
+    @unittest.skipUnless(PRIVATE_PATHS, "requires a private mount namespace")
+    def test_device_directories_and_directory_globs(self):
+        tree = self.directory / "device-tree"
+        for name, source in (("adapter0/null", "/dev/null"), ("adapter1/zero", "/dev/zero")):
+            target = tree / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.touch()
+            subprocess.run(["mount", "--bind", source, str(target)], check=True)
+            self.addCleanup(subprocess.run, ["umount", str(target)], check=True)
+        (tree / "ordinary-file").touch()
+        (tree / "device-link").symlink_to("/dev/null")
+        (tree / "directory-link").symlink_to(tree)
+        self.base["mounts"].append({"destination": "/dev/test", "source": "old",
+                                    "type": "bind", "options": []})
+
+        for source in (str(tree), str(tree / "adapter*")):
+            with self.subTest(source=source):
+                result = self.prepare(settings={"devices": [
+                    {"source": source, "destination": "/dev/test"},
+                    {"source": "/dev/zero", "destination": "/dev/test/adapter0/null"},
+                    {"destination": "/dev/test/adapter1/zero", "remove": True}]})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.generated()
+                self.assertEqual([d["path"] for d in config["linux"]["devices"]],
+                                 ["/dev/test/adapter0/null"])
+                self.assert_device(config, "/dev/test/adapter0/null", "/dev/zero")
+                self.assertFalse(any(m["destination"] == "/dev/test"
+                                     for m in config["mounts"]))
+
+        result = self.prepare(settings={"devices": [{"source": str(tree)}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()
+        self.assert_device(config, str(tree / "adapter0/null"), "/dev/null")
+        self.assert_device(config, str(tree / "adapter1/zero"), "/dev/zero")
+
+        alias = self.directory / "tree-alias"
+        alias.symlink_to(tree)
+        result = self.prepare(settings={"devices": [{"source": str(alias)}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_device(self.generated(), str(alias / "adapter0/null"), "/dev/null")
+
+        target = tree / "hostname"
+        target.touch()
+        subprocess.run(["mount", "--bind", "/dev/null", str(target)], check=True)
+        self.addCleanup(subprocess.run, ["umount", str(target)], check=True)
+        result = self.prepare(settings={"devices": [
+            {"source": str(tree / "host*"), "destination": "/etc"}]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reserved mount destination: /etc/hostname", result.stderr)
 
     def test_payload_memory_limit_preserves_other_resources(self):
         self.base["linux"]["resources"]["memory"] = {"limit": 123, "swap": 456}
@@ -604,10 +749,7 @@ class PrepareTests(unittest.TestCase):
         (self.devices / "kvm").symlink_to("/dev/null")
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
-        mounts = [m for m in self.generated()["mounts"] if m["destination"] == "/dev/kvm"]
-        self.assertEqual(mounts, [{"destination": "/dev/kvm", "type": "bind",
-                                   "source": str(self.devices / "kvm"),
-                                   "options": ["bind", "rprivate", "nosuid", "noexec"]}])
+        self.assert_device(self.generated(), "/dev/kvm", "/dev/null")
 
     @unittest.skipUnless(PRIVATE_PATHS, "requires the smoke test's private /etc and /dev")
     def test_optional_devices(self):
@@ -615,14 +757,15 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any(m["destination"] in ("/dev/kvm", "/dev/fuse")
                              for m in self.generated()["mounts"]))
+        self.assertFalse(any(d["path"] in ("/dev/kvm", "/dev/fuse")
+                             for d in self.generated()["linux"].get("devices", [])))
         (self.devices / "kvm").symlink_to("/dev/null")
         (self.devices / "fuse").symlink_to("/dev/zero")
         result = self.prepare()
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.generated()
-        mounts = {m["destination"]: m for m in config["mounts"]}
-        self.assertEqual(mounts["/dev/kvm"]["source"], str(self.devices / "kvm"))
-        self.assertEqual(mounts["/dev/fuse"]["source"], str(self.devices / "fuse"))
+        self.assert_device(config, "/dev/kvm", "/dev/null")
+        self.assert_device(config, "/dev/fuse", "/dev/zero")
         rules = config["linux"]["resources"]["devices"]
         self.assertTrue(any(r.get("allow") is True and r.get("major") == 1 and
                             r.get("minor") == 3 for r in rules))

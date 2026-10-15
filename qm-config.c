@@ -271,7 +271,7 @@ static void path_operation_free(void *data)
 	free(data);
 }
 
-static bool reserved_mount(const char *destination)
+bool reserved_mount_destination(const char *destination)
 {
 	const char *const reserved[] = {"/",
 					"/run/.containerenv",
@@ -309,7 +309,7 @@ static void parse_path_operation(PtrArray *operations, json_object *value, bool 
 
 	if (!operation->destination)
 		operation->destination = xstrdup(operation->source);
-	if (reserved_mount(operation->destination))
+	if (reserved_mount_destination(operation->destination))
 		errx(1, "%s: reserved mount destination: %s", filename,
 		     operation->destination);
 }

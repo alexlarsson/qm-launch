@@ -107,18 +107,33 @@ Mount objects have absolute `source` and `destination` paths, an optional
 boolean `optional` (default false), and an optional `options` array of mount
 flags. Default options are `["rbind", "rprivate"]`; explicit options replace
 that list. Device objects have an absolute `source`, an optional `destination`
-(defaulting to the source), and an optional boolean `optional`. Both character
-and block devices are supported; device directories and patterns are not.
-Devices use a bind mount and a matching `rwm` device cgroup permission.
-For either kind, `optional: true` skips a missing source; other lookup errors
-still fail.
+(defaulting to the source), and an optional boolean `optional`. Character and
+block devices are added as OCI device nodes with the source's major/minor,
+permission bits, UID and GID, plus a matching `rwm` device cgroup permission.
+The runtime creates the nodes using the container's user namespace mappings.
+Use `mounts` when a device bind mount is wanted instead.
+
+Device sources also accept directories and glob patterns (`*`, `?`, and bracket
+expressions). Directories are searched recursively for character and block
+devices, ignoring ordinary files and symlinks within the directory. Glob matches
+are sorted, and matching directories are searched in the same way. Without an
+explicit destination, each discovered device keeps its source path. For a directory,
+an explicit destination remaps its contents there. For a glob, it remaps the tree
+below the first wildcard component: source `/dev/dri/render*` with destination
+`/dev/gpu` creates `/dev/gpu/renderD128`, etc. Backslashes in patterns are literal.
+Selections are expanded at startup; later host device changes are not tracked.
+
+For either kind, `optional: true` skips a missing source; for device selections,
+it also permits no matching devices. Other lookup errors still fail.
 
 Container destination is the identity for mounts and devices. Later entries
 replace earlier requests at that destination, including entries of the other
 kind. An object with `"remove": true` requires only `destination` and `remove`;
 it removes the mount/device at that destination, and a later addition can restore
-it. Requests are resolved before probing optional sources or granting device
-access. Within each configuration file, mount entries precede device entries,
+it. Replaced requests are discarded before probing their sources. Device directories
+and globs expand into individual destinations, which later entries can override or
+remove. Device access is granted after resolving these operations. Within each
+configuration file, mount entries precede device entries,
 independent of JSON key order. Existing OCI mounts are replaced in place; new
 mounts are appended in first-destination order, so place parent mounts before
 their children. For example, `/etc/qmc.conf.d/50-workload.conf` could contain:
@@ -128,7 +143,9 @@ their children. For example, `/etc/qmc.conf.d/50-workload.conf` could contain:
   "memory-max": "5G",
   "devices": [
     {"destination": "/dev/kvm", "remove": true},
-    {"source": "/dev/net/tun", "optional": true}
+    {"source": "/dev/net/tun", "optional": true},
+    {"source": "/dev/snd", "optional": true},
+    {"source": "/dev/dri/render*", "optional": true}
   ],
   "mounts": [
     {"destination": "/etc/localtime", "remove": true},

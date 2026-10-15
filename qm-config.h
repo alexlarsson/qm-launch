@@ -55,6 +55,8 @@ typedef struct {
 
 void config_free(Config *config);
 
+bool reserved_mount_destination(const char *destination);
+
 static inline void cleanup_config(Config **config)
 {
 	config_free(*config);

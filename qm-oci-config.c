@@ -3,11 +3,14 @@
  * See COPYING for the full license text.
  */
 
+#define _GNU_SOURCE
 #include "qm-oci-config.h"
 #include "qm-utils.h"
 
 #include <err.h>
 #include <errno.h>
+#include <fts.h>
+#include <glob.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -101,28 +104,209 @@ static void add_device_rule(json_object *linux_config, const struct stat *st)
 	js_array_add(rules, steal_ptr(&rule));
 }
 
+static void add_device(json_object *linux_config, const char *destination,
+		       const struct stat *st)
+{
+	autofreejson json_object *device = js_new_object();
+	js_set_string(device, "path", destination);
+	js_set_string(device, "type", S_ISCHR(st->st_mode) ? "c" : "b");
+	js_object_add(device, "major", js_new_int(major(st->st_rdev)));
+	js_object_add(device, "minor", js_new_int(minor(st->st_rdev)));
+	js_object_add(device, "fileMode", js_new_int(st->st_mode & 07777));
+	js_object_add(device, "uid", js_new_int(st->st_uid));
+	js_object_add(device, "gid", js_new_int(st->st_gid));
+
+	js_array_add(ensure_array(linux_config, "devices"), steal_ptr(&device));
+	add_device_rule(linux_config, st);
+}
+
+typedef struct {
+	const PathOperation *operation;
+	char *source;
+	char *destination;
+	bool remove;
+} ResolvedPath;
+
+static void resolved_path_free(void *data)
+{
+	ResolvedPath *path = data;
+	free(path->source);
+	free(path->destination);
+	free(path);
+}
+
+static void resolve_path(PtrArray *paths, const PathOperation *operation,
+			 const char *source, const char *destination, bool remove)
+{
+	autofree char *normalized = canonicalize_path(destination);
+	if (reserved_mount_destination(normalized))
+		errx(1, "reserved mount destination: %s", normalized);
+
+	ResolvedPath *path = xnew(ResolvedPath);
+	*path = (ResolvedPath){
+		.operation = operation,
+		.source = source ? canonicalize_path(source) : NULL,
+		.destination = steal_ptr(&normalized),
+		.remove = remove,
+	};
+
+	for (size_t i = 0; i < paths->length; i++) {
+		ResolvedPath *previous = paths->items[i];
+		if (!strcmp(previous->destination, path->destination)) {
+			resolved_path_free(previous);
+			paths->items[i] = path;
+			return;
+		}
+	}
+
+	ptr_array_add(paths, path);
+}
+
+static int compare_device_paths(const FTSENT **a, const FTSENT **b)
+{
+	return strcmp((*a)->fts_name, (*b)->fts_name);
+}
+
+static bool expand_device_directory(PtrArray *paths, const PathOperation *operation,
+				    const char *source, const char *destination)
+{
+	autofree char *root = xstrdup(source);
+	char *roots[] = {root, NULL};
+	FTS *tree = fts_open(roots, FTS_PHYSICAL | FTS_COMFOLLOW | FTS_NOCHDIR,
+			     compare_device_paths);
+	if (!tree)
+		err(1, "fts_open %s", source);
+
+	bool found = false;
+	for (;;) {
+		errno = 0;
+		FTSENT *entry = fts_read(tree);
+		if (!entry) {
+			if (errno)
+				err(1, "fts_read %s", source);
+			break;
+		}
+
+		if (entry->fts_info == FTS_ERR || entry->fts_info == FTS_DNR ||
+		    entry->fts_info == FTS_NS)
+			errx(1, "%s: %s", entry->fts_path, strerror(entry->fts_errno));
+
+		/* Do not follow symlinks inside a directory or include ordinary files. */
+		if (entry->fts_info == FTS_SL || entry->fts_info == FTS_SLNONE ||
+		    (!S_ISCHR(entry->fts_statp->st_mode) &&
+		     !S_ISBLK(entry->fts_statp->st_mode)))
+			continue;
+
+		autofree char *target =
+			join_path(destination, entry->fts_path + strlen(source));
+		resolve_path(paths, operation, entry->fts_path, target, false);
+		found = true;
+	}
+
+	if (fts_close(tree) < 0)
+		err(1, "fts_close %s", source);
+
+	return found;
+}
+
+static char *device_destination(const PathOperation *operation, const char *source,
+				bool pattern)
+{
+	if (!strcmp(operation->source, operation->destination))
+		return xstrdup(source);
+	if (!pattern)
+		return xstrdup(operation->destination);
+
+	/* Remap the tree below the source's first wildcard component. */
+	const char *wildcard = strpbrk(operation->source, "*?[");
+	const char *prefix_end =
+		memrchr(operation->source, '/', wildcard - operation->source + 1);
+	return join_path(operation->destination,
+			 source + (prefix_end - operation->source) + 1);
+}
+
+static void expand_devices(PtrArray *paths, const PathOperation *operation)
+{
+	/* Also remove an old mount/node at the directory or pattern destination. */
+	resolve_path(paths, operation, NULL, operation->destination, true);
+
+	glob_t matches = {0};
+	int result = glob(operation->source, GLOB_ERR | GLOB_NOESCAPE | GLOB_NOCHECK,
+			  NULL, &matches);
+	if (result == GLOB_NOSPACE)
+		oom();
+	if (result != 0 && result != GLOB_NOMATCH)
+		err(1, "glob %s", operation->source);
+
+	bool pattern = matches.gl_flags & GLOB_MAGCHAR;
+	bool found = false;
+	for (size_t i = 0; i < matches.gl_pathc; i++) {
+		const char *source = matches.gl_pathv[i];
+		autofree char *destination =
+			device_destination(operation, source, pattern);
+		struct stat st;
+		int stat_result = stat(source, &st);
+
+		/* Defer individual-device validation until after resolving expanded
+		 * destinations, since a later selection may replace this request.
+		 */
+		if (!pattern && (stat_result < 0 || !S_ISDIR(st.st_mode))) {
+			resolve_path(paths, operation, source, destination, false);
+			found = true;
+			continue;
+		}
+
+		if (stat_result < 0) {
+			if (operation->optional && errno == ENOENT)
+				continue;
+			err(1, "stat %s", source);
+		}
+
+		if (S_ISDIR(st.st_mode)) {
+			found |= expand_device_directory(paths, operation, source,
+							 destination);
+		} else if (S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode)) {
+			resolve_path(paths, operation, source, destination, false);
+			found = true;
+		}
+	}
+	globfree(&matches);
+
+	if (!found && !operation->optional)
+		errx(1, "no devices found in %s", operation->source);
+}
+
 static void configure_paths(json_object *oci, const Config *config)
 {
 	if (!config->path_operations.length)
 		return;
 
-	/* Last operation per destination wins. Resolve before probing sources or
-	 * granting device access, so removed/replaced devices leave no rules.
-	 */
+	/* Reserve the first position of each destination, preserving mount order. */
 	PtrArray resolved = {0};
 	for (size_t i = 0; i < config->path_operations.length; i++) {
 		const PathOperation *operation = config->path_operations.items[i];
+		resolve_path(&resolved, operation, NULL, operation->destination, true);
+	}
+
+	/* Skip replaced requests before probing their sources, then expand the
+	 * surviving requests in load order so later entries override discovered nodes.
+	 */
+	for (size_t i = 0; i < config->path_operations.length; i++) {
+		const PathOperation *operation = config->path_operations.items[i];
 		size_t j;
-		for (j = 0; j < resolved.length; j++) {
-			const PathOperation *previous = resolved.items[j];
-			if (!strcmp(previous->destination, operation->destination))
+		for (j = i + 1; j < config->path_operations.length; j++) {
+			const PathOperation *later = config->path_operations.items[j];
+			if (!strcmp(later->destination, operation->destination))
 				break;
 		}
+		if (j < config->path_operations.length)
+			continue;
 
-		if (j < resolved.length)
-			resolved.items[j] = config->path_operations.items[i];
+		if (operation->device && !operation->remove)
+			expand_devices(&resolved, operation);
 		else
-			ptr_array_add(&resolved, config->path_operations.items[i]);
+			resolve_path(&resolved, operation, operation->source,
+				     operation->destination, operation->remove);
 	}
 
 	json_object *mounts = js_need(oci, "mounts", json_type_array);
@@ -130,15 +314,16 @@ static void configure_paths(json_object *oci, const Config *config)
 
 	/* Remove base device nodes/rules before adding any new access rules. */
 	for (size_t i = 0; i < resolved.length; i++) {
-		const PathOperation *operation = resolved.items[i];
-		remove_device(linux_config, operation->destination);
+		const ResolvedPath *path = resolved.items[i];
+		remove_device(linux_config, path->destination);
 	}
 
 	for (size_t i = 0; i < resolved.length; i++) {
-		const PathOperation *operation = resolved.items[i];
-		const char *destination = operation->destination;
-		const char *source = operation->source;
-		bool remove = operation->remove;
+		const ResolvedPath *path = resolved.items[i];
+		const PathOperation *operation = path->operation;
+		const char *destination = path->destination;
+		const char *source = path->source;
+		bool remove = path->remove;
 		bool device = operation->device;
 		struct stat st;
 
@@ -160,6 +345,12 @@ static void configure_paths(json_object *oci, const Config *config)
 			continue;
 		}
 
+		if (device) {
+			remove_path(mounts, "destination", destination);
+			add_device(linux_config, destination, &st);
+			continue;
+		}
+
 		autofreejson json_object *mount = js_new_object();
 		js_set_string(mount, "destination", destination);
 		js_set_string(mount, "source", source);
@@ -171,11 +362,6 @@ static void configure_paths(json_object *oci, const Config *config)
 				js_array_add(options,
 					     js_new_string(operation->options.items[j]));
 			js_object_add(mount, "options", steal_ptr(&options));
-		} else if (device) {
-			const char *const flags[] = {"bind", "rprivate", "nosuid",
-						     "noexec"};
-			js_object_add(mount, "options",
-				      js_new_strings(flags, N_ELEMENTS(flags)));
 		} else {
 			const char *const flags[] = {"rbind", "rprivate"};
 			js_object_add(mount, "options",
@@ -199,12 +385,9 @@ static void configure_paths(json_object *oci, const Config *config)
 
 		if (!replaced)
 			js_array_add(mounts, json_object_get(mount));
-
-		if (device)
-			add_device_rule(linux_config, &st);
 	}
 
-	ptr_array_clear(&resolved, NULL);
+	ptr_array_clear(&resolved, resolved_path_free);
 }
 
 static void configure_capabilities(json_object *oci, const Config *config)

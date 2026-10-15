@@ -70,7 +70,7 @@ int main(int argc, char **argv)
         fd = open("/shared/token", O_WRONLY);
         if (fd >= 0 || errno != EROFS)
             return 22;
-        fd = open("/dev/test-null", O_RDONLY);
+        fd = open("/dev/null", O_RDONLY);
         if (fd < 0 || read(fd, contents, 1) != 0)
             return 24;
         close(fd);
@@ -386,7 +386,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                                             {"source": str(directory / "missing"),
                                              "destination": "/optional", "optional": True}],
                                         "devices": [
-                                            {"source": "/dev/null", "destination": "/dev/test-null"},
+                                            # Rootless crun binds OCI devices from their host path.
+                                            {"source": "/dev/nul?"},
                                             {"source": "/dev/zero", "destination": "/dev/removed"},
                                             {"destination": "/dev/removed", "remove": True}]})
     try:
