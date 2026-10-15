@@ -450,11 +450,12 @@ static int nft_setup(struct nft_ctx *ctx, const NetworkOptions *options,
 {
 	autofreejson json_object *quoted = js_new_string(owner);
 	/* JSON preserves arbitrary path characters in the ownership comment. */
-	autofree char *table =
-		xasprintf("{\"nftables\":[{\"create\":{\"table\":{\"family\":\"ip\","
-			  "\"name\":\"%s\",\"comment\":%s}}}]}",
-			  options->nft_table,
-			  json_object_to_json_string_ext(quoted, JSON_C_TO_STRING_PLAIN));
+	autofree char *table = xasprintf(
+		"{\"nftables\":[{\"create\":{\"table\":{\"family\":\"ip\","
+		"\"name\":\"%s\",\"comment\":%s}}}]}",
+		options->nft_table,
+		json_object_to_json_string_ext(
+			quoted, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
 	if (nft_command(ctx, table))
 		return -1;
 	autofree char *subnet = xasprintf("%s/%u", options->subnet, options->prefix_len);

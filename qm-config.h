@@ -22,21 +22,22 @@ typedef struct {
 	bool remove;
 	bool optional;
 
-	bool options_set; /* Distinguishes an empty list from default options. */
+	bool options_set; /* Preserves an explicit empty list during serialization. */
 	PtrArray options; /* Owned strings. */
 } PathOperation;
 
 typedef struct {
-	const char *name; /* Static normalized capability name. */
+	char *name; /* Normalized capability name, or "all". */
 	bool remove;
 } CapabilityOperation;
+
+/* NULL-terminated list of known Linux capability names. */
+extern const char *const capability_names[];
 
 typedef struct {
 	char *base_config;
 	char *hostname;
 	char *rootfs;
-	char *etc_dir;
-	char *var_dir;
 	char *seccomp_file;
 	char *resolv_conf;
 	char *ip;
@@ -49,9 +50,12 @@ typedef struct {
 	bool memory_max_set;
 	int64_t memory_max;
 
-	PtrArray path_operations;	/* Owned PathOperation pointers, in load order. */
-	PtrArray capability_operations; /* Owned CapabilityOperation pointers. */
-	PtrArray unmask;		/* Owned strings. */
+	/* Owned PathOperation pointers, in load order within each list. */
+	PtrArray mounts;
+	PtrArray devices;
+
+	PtrArray capabilities; /* Owned CapabilityOperation pointers, in load order. */
+	PtrArray unmask;       /* Owned strings. */
 } Config;
 
 void config_free(Config *config);
@@ -74,3 +78,6 @@ static inline void cleanup_config(Config **config)
  */
 Config *configuration_load(const char *vendor_dir, const char *admin_dir,
 			   const char *filename);
+
+/* Return an owned JSON object in qmc.conf format, including defaults. */
+json_object *configuration_serialize(const Config *config);

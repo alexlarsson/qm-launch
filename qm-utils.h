@@ -131,7 +131,7 @@ void js_cleanup_json(void *p);
 
 /* Constructors and js_load return owned references. Getters return borrowed
  * references; string pointers remain valid while their JSON value is alive.
- * js_object_add and js_array_add consume the supplied reference. */
+ * js_object_add, js_array_add and js_array_insert consume the supplied reference. */
 json_object *js_new_int(int64_t value);
 json_object *js_new_bool(bool value);
 json_object *js_new_strings(const char *const values[], size_t count);
@@ -141,6 +141,8 @@ json_object *js_new_object(void);
 
 void js_object_add(json_object *object, const char *key, json_object *value);
 void js_array_add(json_object *array, json_object *value);
+/* Insert before index, which must be at most the current array length. */
+void js_array_insert(json_object *array, size_t index, json_object *value);
 
 json_object *js_get(json_object *object, const char *key);
 json_object *js_need(json_object *object, const char *key, enum json_type type);

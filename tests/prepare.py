@@ -55,7 +55,10 @@ class PrepareTests(unittest.TestCase):
             "userns": "auto" if PRIVATE_PATHS else "off",
             "mounts": self.vendor["mounts"],
             "devices": self.vendor["devices"],
+            "capabilities": self.vendor["capabilities"],
         }
+        if "path" not in inputs["base.json"]["root"]:
+            config["rootfs"] = self.vendor["rootfs"]
         if seccomp is not False:
             config["seccomp"] = str(self.directory / "seccomp.json")
         if not host_resolv:
@@ -138,8 +141,22 @@ class PrepareTests(unittest.TestCase):
         self.assertFalse(any(e.startswith("container_uuid=") for e in config["process"]["env"]))
         self.assertEqual(config["process"]["args"],
                          [*self.base["process"]["args"], "--machine-id=" + HOST_MACHINE_ID])
-        self.assertEqual(config["root"], self.base["root"])
-        self.assertEqual(config["process"]["capabilities"], self.base["process"]["capabilities"])
+        self.assertEqual(config["root"], {**self.base["root"], "path": self.vendor["rootfs"]})
+        self.assertNotIn("capabilities", self.base["process"])
+        expected_caps = """
+            CAP_AUDIT_CONTROL CAP_AUDIT_READ CAP_AUDIT_WRITE CAP_BLOCK_SUSPEND
+            CAP_BPF CAP_CHECKPOINT_RESTORE CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+            CAP_FOWNER CAP_FSETID CAP_IPC_LOCK CAP_IPC_OWNER CAP_KILL CAP_LEASE
+            CAP_LINUX_IMMUTABLE CAP_MAC_ADMIN CAP_MAC_OVERRIDE CAP_MKNOD CAP_NET_ADMIN
+            CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_NET_RAW CAP_PERFMON CAP_SETFCAP
+            CAP_SETGID CAP_SETPCAP CAP_SETUID CAP_SYSLOG CAP_SYS_ADMIN CAP_SYS_CHROOT
+            CAP_SYS_MODULE CAP_SYS_NICE CAP_SYS_PACCT CAP_SYS_PTRACE CAP_SYS_RAWIO
+            CAP_SYS_TIME CAP_SYS_TTY_CONFIG CAP_WAKE_ALARM
+        """.split()
+        caps = config["process"]["capabilities"]
+        self.assertEqual(set(caps), {"bounding", "effective", "permitted"})
+        for values in caps.values():
+            self.assertEqual(sorted(values), sorted(expected_caps))
         self.assertEqual(config["linux"]["mountLabel"], self.base["linux"]["mountLabel"])
         self.assertTrue(config["linux"]["cgroupsPath"].endswith("/payload"))
         if EXPECTED_CGROUP is not None:
@@ -165,6 +182,23 @@ class PrepareTests(unittest.TestCase):
         scheduling = [r for r in rules if r["names"] == ["sched_setscheduler"]]
         self.assertEqual([r["args"][0]["value"] for r in scheduling], [0, 3, 5])
         self.assertTrue(all("includes" not in r and "excludes" not in r for r in rules))
+
+    def test_default_mounts_precede_their_children(self):
+        destinations = ("/etc", "/var", "/var/tmp")
+        self.assertFalse(any(m["destination"] in destinations for m in self.base["mounts"]))
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mounts = self.generated()["mounts"]
+        order = [m["destination"] for m in mounts]
+        for destination, source in (("/etc", "/etc/qm"), ("/var", "/var/qm"),
+                                     ("/var/tmp", "/var/qm/tmp")):
+            with self.subTest(destination=destination):
+                self.assertEqual([m for m in mounts if m["destination"] == destination], [
+                    {"type": "bind", "source": source, "destination": destination,
+                     "options": ["rbind", "rprivate"]}])
+                for child in order:
+                    if child.startswith(destination + "/"):
+                        self.assertLess(order.index(destination), order.index(child))
 
     def test_configured_network_hosts_survive_configuration_changes(self):
         settings = {"ip": "172.30.20.2", "gateway": "172.30.20.1", "prefix-length": 28}
@@ -273,8 +307,12 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(self.generated()["linux"]["seccomp"], profile)
 
     def test_paths_and_timezone(self):
-        result = self.prepare(settings={"rootfs": "/test/rootfs", "etc-dir": "/test/etc",
-                                        "var-dir": "/test/var"}, env={**os.environ, "TZ": "Europe/Stockholm"})
+        result = self.prepare(settings={
+            "rootfs": "/test/rootfs",
+            "mounts": [*self.vendor["mounts"],
+                       {"source": "/test/etc", "destination": "/etc"},
+                       {"source": "/test/var", "destination": "/var"}],
+        }, env={**os.environ, "TZ": "Europe/Stockholm"})
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.generated()
         self.assertEqual(config["root"]["path"], "/test/rootfs")
@@ -282,8 +320,17 @@ class PrepareTests(unittest.TestCase):
         mounts = {m["destination"]: m["source"] for m in config["mounts"]}
         self.assertEqual(mounts["/etc"], "/test/etc")
         self.assertEqual(mounts["/var"], "/test/var")
-        self.assertEqual(mounts["/var/tmp"], "/test/var/tmp")
+        self.assertEqual(mounts["/var/tmp"], "/var/qm/tmp")
         self.assertIn("TZ=Europe/Stockholm", config["process"]["env"])
+
+    def test_default_mounts_can_be_removed(self):
+        result = self.prepare(settings={"mounts": [
+            *self.vendor["mounts"],
+            *[{"destination": path, "remove": True} for path in ("/etc", "/var", "/var/tmp")],
+        ]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(m["destination"] in ("/etc", "/var", "/var/tmp")
+                             for m in self.generated()["mounts"]))
 
     def test_localtime_mount(self):
         result = self.prepare()
@@ -291,7 +338,8 @@ class PrepareTests(unittest.TestCase):
         mounts = {m["destination"]: m for m in self.generated()["mounts"]}
         if pathlib.Path("/etc/localtime").exists():
             self.assertEqual(mounts["/etc/localtime"]["source"], "/etc/localtime")
-            self.assertIn("ro", mounts["/etc/localtime"]["options"])
+            self.assertEqual(mounts["/etc/localtime"]["options"],
+                             ["ro", "nosuid", "noexec", "nodev", "rbind", "rprivate"])
         else:
             self.assertNotIn("/etc/localtime", mounts)
 
@@ -313,7 +361,7 @@ class PrepareTests(unittest.TestCase):
             {"destination": "/etc/localtime", "remove": True},
             {"source": missing, "destination": "/shared", "optional": True},
             {"source": str(source) + "/missing/..", "destination": "/shared/./",
-             "options": ["rbind", "ro"]},
+             "options": ["ro"]},
             {"source": missing, "destination": "/absent", "optional": True},
             {"source": missing, "destination": "/removed"},
             {"destination": "/removed/child/..", "remove": True}]})
@@ -321,7 +369,7 @@ class PrepareTests(unittest.TestCase):
         mounts = self.generated()["mounts"]
         self.assertEqual([m for m in mounts if m["destination"] == "/shared"], [
             {"source": str(source), "destination": "/shared", "type": "bind",
-             "options": ["rbind", "ro"]}])
+             "options": ["ro", "rbind", "rprivate"]}])
         self.assertFalse(any(m["destination"] in ("/etc/localtime", "/absent", "/removed")
                              for m in mounts))
 
@@ -335,8 +383,7 @@ class PrepareTests(unittest.TestCase):
         mounts = [m for m in self.generated()["mounts"]
                   if m["destination"] in destinations]
         self.assertEqual([m["destination"] for m in mounts], destinations)
-        self.assertEqual(mounts[0]["options"], [])
-        self.assertTrue(all(m["options"] == ["rbind", "rprivate"] for m in mounts[1:]))
+        self.assertTrue(all(m["options"] == ["rbind", "rprivate"] for m in mounts))
 
     def test_device_operations_resolve_before_granting_access(self):
         missing = str(self.directory / "missing")
@@ -619,16 +666,17 @@ class PrepareTests(unittest.TestCase):
                 self.assertEqual(config["resources"]["pids"], {"limit": -1})
 
     def test_capability_changes_precede_seccomp_resolution(self):
-        self.base["process"]["capabilities"]["ambient"] = ["CAP_NET_RAW"]
-        self.base["process"]["capabilities"]["inheritable"] = ["CAP_NET_RAW"]
+        self.base["process"]["capabilities"] = {
+            "ambient": ["CAP_NET_RAW"], "inheritable": ["CAP_NET_RAW"]}
         profile = {"defaultAction": "SCMP_ACT_ERRNO", "syscalls": [
             {"names": ["getpid"], "action": "SCMP_ACT_ALLOW",
              "includes": {"caps": ["CAP_SYS_RESOURCE"]}},
             {"names": ["getppid"], "action": "SCMP_ACT_ALLOW",
              "includes": {"caps": ["CAP_NET_RAW"]}}]}
         result = self.prepare(seccomp=profile, settings={
-            "add-capabilities": ["sys_resource", "CAP_SYS_RESOURCE"],
-            "drop-capabilities": ["net_raw"]})
+            "capabilities": [*self.vendor["capabilities"],
+                             {"name": "sys_resource"}, {"name": "CAP_SYS_RESOURCE"},
+                             {"name": "net_raw", "remove": True}]})
         self.assertEqual(result.returncode, 0, result.stderr)
         config = self.generated()
         caps = config["process"]["capabilities"]
@@ -640,12 +688,19 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(config["linux"]["seccomp"]["syscalls"], [
             {"names": ["getpid"], "action": "SCMP_ACT_ALLOW"}])
 
-    def test_drop_all_then_add_capability(self):
-        result = self.prepare(settings={"drop-capabilities": ["all"],
-                                        "add-capabilities": ["CAP_CHOWN"]})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.generated()["process"]["capabilities"], {
-            name: ["CAP_CHOWN"] for name in ("bounding", "effective", "permitted")})
+    def test_capabilities_apply_in_list_order(self):
+        for capabilities, expected in (
+            ([{"name": "all", "remove": True}, {"name": "CAP_CHOWN"}], ["CAP_CHOWN"]),
+            ([{"name": "chown"}, {"name": "ALL", "remove": True}], []),
+            ([{"name": "all", "remove": True}, {"name": "chown", "remove": False}],
+             ["CAP_CHOWN"]),
+            ([{"name": "ALL"}, {"name": "all", "remove": True}], []),
+        ):
+            with self.subTest(capabilities=capabilities):
+                result = self.prepare(settings={"capabilities": capabilities})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.generated()["process"]["capabilities"], {
+                    name: expected for name in ("bounding", "effective", "permitted")})
 
     def test_unmask_specific_paths_and_all(self):
         result = self.prepare(settings={"unmask": ["/proc/./keys/", "/proc/unused/../sys", "/absent"]})
@@ -920,9 +975,9 @@ class PrepareTests(unittest.TestCase):
         self.assertIn("invalid qm_root size", result.stderr)
 
     def test_capability_filter(self):
-        for capability in ("CAP_SYS_ADMIN", "CAP_BPF", "CAP_PERFMON", "CAP_AUDIT_WRITE"):
-            self.base["process"]["capabilities"]["bounding"].remove(capability)
-        result = self.prepare()
+        removals = [{"name": name, "remove": True}
+                    for name in ("CAP_SYS_ADMIN", "CAP_BPF", "CAP_PERFMON", "CAP_AUDIT_WRITE")]
+        result = self.prepare(settings={"capabilities": [*self.vendor["capabilities"], *removals]})
         self.assertEqual(result.returncode, 0, result.stderr)
         rules = self.generated()["linux"]["seccomp"]["syscalls"]
         for syscall in ("bpf", "perf_event_open"):
@@ -945,7 +1000,7 @@ class PrepareTests(unittest.TestCase):
                 self.assertIn(error, result.stderr)
 
     def test_absolute_path_errors(self):
-        for option in ("--runtime-dir", "rootfs", "etc-dir", "var-dir", "base-config", "seccomp", "resolv-conf"):
+        for option in ("--runtime-dir", "rootfs", "base-config", "seccomp", "resolv-conf"):
             with self.subTest(option=option):
                 result = self.prepare(**({"extra": (option, "relative")} if option.startswith("--")
                                          else {"settings": {option: "relative"}}))

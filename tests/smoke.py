@@ -18,6 +18,7 @@ import time
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent
 LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
+VENDOR = json.loads((SOURCE / "qmc.conf.in").read_text())
 
 
 def run(*args):
@@ -240,8 +241,8 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
     config["linux"].pop("mountLabel")
     config["linux"]["resources"] = {"devices": []}
     config["linux"].pop("sysctl")
-    config["mounts"] = [m for m in config["mounts"] if m["destination"] not in
-                        ("/etc", "/var", "/var/tmp", "/sys/fs/selinux")]
+    config["mounts"] = [m for m in config["mounts"]
+                        if m["destination"] != "/sys/fs/selinux"]
     for mount in config["mounts"]:
         if mount["destination"] == "/etc/localtime":
             mount["source"] = str(directory / "missing-localtime")
@@ -301,6 +302,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
         if notify_socket is not None:
             environment["NOTIFY_SOCKET"] = str(notify_socket)
         config = {"base-config": str(base), "userns": "off",
+                  "capabilities": VENDOR["capabilities"],
                   "seccomp": str(SOURCE / "tests/seccomp-no-rt.json"),
                   "resolv-conf": str(resolv), **(settings or {})}
         filename = directory / f"qmc-{attempt}.conf"
@@ -382,7 +384,7 @@ with tempfile.TemporaryDirectory(prefix="qm-launch-smoke-") as temporary:
                               settings={"hostname": "qm-test", "memory-max": "256M",
                                         "mounts": [
                                             {"source": str(shared), "destination": "/shared/token",
-                                             "options": ["bind", "ro"]},
+                                             "options": ["ro"]},
                                             {"source": str(directory / "missing"),
                                              "destination": "/optional", "optional": True}],
                                         "devices": [

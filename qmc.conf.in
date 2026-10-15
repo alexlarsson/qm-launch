@@ -5,19 +5,25 @@
   "gateway": "10.90.0.1",
   "prefix-length": 24,
   "rootfs": "/usr/lib/qm/rootfs",
-  "etc-dir": "/etc/qm",
-  "var-dir": "/var/qm",
   "seccomp": "/usr/share/qm/seccomp-no-rt.json",
+  "capabilities": [
+    {"name": "all"},
+    {"name": "CAP_SYS_BOOT", "remove": true},
+    {"name": "CAP_SYS_RESOURCE", "remove": true}
+  ],
   "devices": [
     {"source": "/dev/kvm", "optional": true},
     {"source": "/dev/fuse", "optional": true}
   ],
   "mounts": [
+    {"source": "/etc/qm", "destination": "/etc"},
+    {"source": "/var/qm", "destination": "/var"},
+    {"source": "/var/qm/tmp", "destination": "/var/tmp"},
     {
       "source": "/etc/localtime",
       "destination": "/etc/localtime",
       "optional": true,
-      "options": ["bind", "rprivate", "ro", "nosuid", "noexec", "nodev"]
+      "options": ["ro", "nosuid", "noexec", "nodev"]
     }
   ],
   "userns": "auto",

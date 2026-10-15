@@ -370,46 +370,55 @@ static bool same_path_request(const PathOperation *a, const PathOperation *b)
 	return !strcmp(a->destination, b->destination);
 }
 
-static void configure_paths(json_object *oci, const Config *config)
+static void resolve_path_operations(PtrArray *resolved, const PtrArray *operations)
 {
-	if (!config->path_operations.length)
-		return;
-
 	/* Reserve the first position of each destination, preserving mount order. */
-	PtrArray resolved = {0};
-	for (size_t i = 0; i < config->path_operations.length; i++) {
-		const PathOperation *operation = config->path_operations.items[i];
+	for (size_t i = 0; i < operations->length; i++) {
+		const PathOperation *operation = operations->items[i];
 		if (!operation->seat)
-			resolve_path(&resolved, operation, NULL, operation->destination,
+			resolve_path(resolved, operation, NULL, operation->destination,
 				     true);
 	}
 
 	/* Skip replaced requests before probing their sources, then expand the
 	 * surviving requests in load order so later entries override discovered nodes.
 	 */
-	for (size_t i = 0; i < config->path_operations.length; i++) {
-		const PathOperation *operation = config->path_operations.items[i];
+	for (size_t i = 0; i < operations->length; i++) {
+		const PathOperation *operation = operations->items[i];
 		size_t j;
-		for (j = i + 1; j < config->path_operations.length; j++) {
-			const PathOperation *later = config->path_operations.items[j];
+		for (j = i + 1; j < operations->length; j++) {
+			const PathOperation *later = operations->items[j];
 			if (same_path_request(later, operation))
 				break;
 		}
-		if (j < config->path_operations.length)
+		if (j < operations->length)
 			continue;
 
 		if (operation->seat) {
 			if (!operation->remove)
-				expand_seat(&resolved, operation);
+				expand_seat(resolved, operation);
 			continue;
 		}
 
 		if (operation->device && !operation->remove)
-			expand_devices(&resolved, operation);
+			expand_devices(resolved, operation);
 		else
-			resolve_path(&resolved, operation, operation->source,
+			resolve_path(resolved, operation, operation->source,
 				     operation->destination, operation->remove);
 	}
+}
+
+static void configure_paths(json_object *oci, const Config *config)
+{
+	if (!config->mounts.length && !config->devices.length)
+		return;
+
+	/* Merge each config list before applying policy. Device entries take
+	 * precedence over mounts, regardless of which drop-in supplied them.
+	 */
+	PtrArray resolved = {0};
+	resolve_path_operations(&resolved, &config->mounts);
+	resolve_path_operations(&resolved, &config->devices);
 
 	json_object *mounts = js_need(oci, "mounts", json_type_array);
 	json_object *linux_config = js_need(oci, "linux", json_type_object);
@@ -458,17 +467,13 @@ static void configure_paths(json_object *oci, const Config *config)
 		js_set_string(mount, "source", source);
 		js_set_string(mount, "type", "bind");
 
-		if (operation->options_set) {
-			autofreejson json_object *options = js_new_array();
-			for (size_t j = 0; j < operation->options.length; j++)
-				js_array_add(options,
-					     js_new_string(operation->options.items[j]));
-			js_object_add(mount, "options", steal_ptr(&options));
-		} else {
-			const char *const flags[] = {"rbind", "rprivate"};
-			js_object_add(mount, "options",
-				      js_new_strings(flags, N_ELEMENTS(flags)));
-		}
+		autofreejson json_object *options = js_new_array();
+		for (size_t j = 0; j < operation->options.length; j++)
+			js_array_add(options, js_new_string(operation->options.items[j]));
+
+		js_array_add(options, js_new_string("rbind"));
+		js_array_add(options, js_new_string("rprivate"));
+		js_object_add(mount, "options", steal_ptr(&options));
 
 		/* Replace in place so parent mounts stay before their children. */
 		bool replaced = false;
@@ -485,16 +490,48 @@ static void configure_paths(json_object *oci, const Config *config)
 			}
 		}
 
-		if (!replaced)
-			js_array_add(mounts, json_object_get(mount));
+		if (!replaced) {
+			/* New parent mounts must precede existing children too, such as
+			 * /etc before the generated hostname, hosts and resolver binds.
+			 */
+			size_t index, length = strlen(destination);
+			for (index = 0; index < json_object_array_length(mounts); index++) {
+				const char *child = js_string(
+					json_object_array_get_idx(mounts, index), "destination");
+				if (starts_with(child, destination) && child[length] == '/')
+					break;
+			}
+			js_array_insert(mounts, index, json_object_get(mount));
+		}
 	}
 
 	ptr_array_clear(&resolved, resolved_path_free);
 }
 
+static void update_capability_set(json_object *set, const CapabilityOperation *operation)
+{
+	const char *name = operation->name;
+	bool all = !strcmp(name, "all");
+
+	if (operation->remove) {
+		for (size_t i = json_object_array_length(set); i > 0; i--)
+			if (all || !strcmp(js_array_string(set, i - 1), name))
+				json_object_array_del_idx(set, i - 1, 1);
+		return;
+	}
+
+	if (all) {
+		for (size_t i = 0; capability_names[i]; i++)
+			if (!js_contains(set, capability_names[i]))
+				js_array_add(set, js_new_string(capability_names[i]));
+	} else if (!js_contains(set, name)) {
+		js_array_add(set, js_new_string(name));
+	}
+}
+
 static void configure_capabilities(json_object *oci, const Config *config)
 {
-	if (!config->capability_operations.length)
+	if (!config->capabilities.length)
 		return;
 
 	json_object *caps =
@@ -502,27 +539,21 @@ static void configure_capabilities(json_object *oci, const Config *config)
 	const char *const sets[] = {"bounding", "effective", "permitted", "inheritable",
 				    "ambient"};
 
-	for (size_t i = 0; i < config->capability_operations.length; i++) {
-		const CapabilityOperation *operation =
-			config->capability_operations.items[i];
-		const char *name = operation->name;
-		bool remove = operation->remove;
+	for (size_t i = 0; i < config->capabilities.length; i++) {
+		const CapabilityOperation *operation = config->capabilities.items[i];
 
 		for (size_t j = 0; j < N_ELEMENTS(sets); j++) {
 			/* Add to the three normal sets; remove from all five. */
+			if (!operation->remove && j >= 3)
+				continue;
+
 			json_object *set = js_get(caps, sets[j]);
-			if (!remove && j < 3)
+			if (!operation->remove)
 				set = ensure_array(caps, sets[j]);
 			if (!set)
 				continue;
 
-			if (remove) {
-				for (size_t k = json_object_array_length(set); k > 0; k--)
-					if (!strcmp(js_array_string(set, k - 1), name))
-						json_object_array_del_idx(set, k - 1, 1);
-			} else if (j < 3 && !js_contains(set, name)) {
-				js_array_add(set, js_new_string(name));
-			}
+			update_capability_set(set, operation);
 		}
 	}
 }

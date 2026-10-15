@@ -45,9 +45,10 @@ install_data('00-qm-forwarding.conf', '90-qm-launch.conf',
 
 python = find_program('python3', required: false)
 if python.found()
-  config_test = executable('test-config', ['tests/config.c', 'qm-config.c', 'qm-utils.c'],
+  config_test = executable('test-config',
+    ['tests/config.c', 'qm-config.c', 'qm-oci-config.c', 'qm-utils.c'],
     include_directories: include_directories('.'),
-    dependencies: dependency('json-c'))
+    dependencies: [dependency('json-c'), dependency('libsystemd', version: '>=254')])
   test('config', python, args: [files('tests/config.py'), config_test, data_dir])
   executable('test-launch-network', launcher_sources + ['tests/network-nft.c'],
     include_directories: include_directories('.'),
@@ -67,6 +68,7 @@ if python.found()
   test('prepare', python, args: [files('tests/prepare.py'), prepare_launcher,
     meson.current_source_dir(), '/payload'])
   test('exec', python, args: [files('tests/exec.py'), launcher])
+  test('inspect', python, args: [files('tests/inspection.py'), launcher])
 endif
 
 utils_test = executable('test-utils', ['tests/utils.c', 'qm-utils.c'],

@@ -67,7 +67,7 @@ RuntimeDirectoryPreserve=yes
 # - Disable the container's own PID limit (linux.resources.pids.limit=-1).
 #   The service-wide TasksMax below still applies.
 # - Keep the root filesystem read-only, with writable /dev, /dev/shm, /tmp and
-#   /run tmpfs mounts and the writable bind mounts described above.
+#   /run tmpfs mounts. Vendor qmc.conf supplies the writable /etc and /var binds.
 # - Set fs.mqueue.queues_max=4 to limit POSIX message queues in the container.
 #   A sizing estimate is RLIMIT_MSGQUEUE / (msg_max * msgsize_max) / 2, where
 #   msg_max is the messages per queue and msgsize_max is the message size.

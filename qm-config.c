@@ -26,6 +26,7 @@ typedef struct {
 	void (*parse)(void *field, json_object *value, const char *name,
 		      const char *filename);
 	void (*destroy)(void *value); /* Owned pointer, or an array element. */
+	json_object *(*serialize)(const void *field); /* NULL omits the field. */
 } ConfigParser;
 
 typedef struct {
@@ -59,7 +60,6 @@ static void parse_object(void *target, json_object *object, const ConfigEntry *e
 			errx(1, "%s: unknown %s key: %s", filename, name, key);
 	}
 
-	/* Table order also defines precedence between fields that share a list. */
 	for (size_t i = 0; i < count; i++) {
 		const ConfigEntry *entry = &entries[i];
 		json_object *value;
@@ -212,17 +212,18 @@ static void parse_prefix_length(void *field, json_object *value, const char *nam
 	*(unsigned int *)field = prefix;
 }
 
+static const char *const userns_names[] = {
+	[USERNS_AUTO] = "auto",
+	[USERNS_OFF] = "off",
+	[USERNS_REQUIRED] = "required",
+};
+
 static void parse_userns(void *field, json_object *value, const char *name,
 			 const char *filename)
 {
-	static const char *const names[] = {
-		[USERNS_AUTO] = "auto",
-		[USERNS_OFF] = "off",
-		[USERNS_REQUIRED] = "required",
-	};
 	const char *string = config_string(value, name, filename);
-	for (size_t i = 0; i < N_ELEMENTS(names); i++) {
-		if (!strcmp(string, names[i])) {
+	for (size_t i = 0; i < N_ELEMENTS(userns_names); i++) {
+		if (!strcmp(string, userns_names[i])) {
 			*(UserNamespaceMode *)field = i;
 			return;
 		}
@@ -245,15 +246,122 @@ static void append_string(void *field, json_object *value, const char *name,
 	ptr_array_add(field, xstrdup(config_string(value, name, filename)));
 }
 
-static const ConfigParser path_parser = {json_type_string, parse_path, free};
-static const ConfigParser hostname_parser = {json_type_string, parse_hostname, free};
-static const ConfigParser seat_parser = {json_type_string, parse_seat, free};
-static const ConfigParser ipv4_parser = {json_type_string, parse_ipv4, free};
-static const ConfigParser prefix_parser = {json_type_int, parse_prefix_length, NULL};
-static const ConfigParser userns_parser = {json_type_string, parse_userns, NULL};
-static const ConfigParser bool_parser = {json_type_boolean, parse_bool, NULL};
-static const ConfigParser memory_parser = {json_type_null, parse_memory, NULL};
-static const ConfigParser strings_parser = {json_type_array, append_string, free};
+static json_object *serialize_object(const void *target, const ConfigEntry *entries,
+				     size_t count, bool include_defaults)
+{
+	autofreejson json_object *result = js_new_object();
+	for (size_t i = 0; i < count; i++) {
+		const ConfigEntry *entry = &entries[i];
+		const ConfigParser *parser = entry->parser;
+		if (!parser->serialize)
+			continue;
+		if (entry->track_presence &&
+		    !*(const bool *)((const char *)target + entry->presence_offset))
+			continue;
+
+		const void *field = (const char *)target + entry->offset;
+		if (parser->type == json_type_array && !entry->track_presence &&
+		    !((const PtrArray *)field)->length)
+			continue;
+
+		autofreejson json_object *value = parser->serialize(field);
+		if (!value || (!include_defaults && parser->type == json_type_boolean &&
+			       !json_object_get_boolean(value)))
+			continue;
+
+		js_object_add(result, entry->name, steal_ptr(&value));
+	}
+	return steal_ptr(&result);
+}
+
+static json_object *serialize_string(const void *field)
+{
+	const char *string = *(char *const *)field;
+	return string ? js_new_string(string) : NULL;
+}
+
+static json_object *serialize_prefix_length(const void *field)
+{
+	return js_new_int(*(const unsigned int *)field);
+}
+
+static json_object *serialize_userns(const void *field)
+{
+	return js_new_string(userns_names[*(const UserNamespaceMode *)field]);
+}
+
+static json_object *serialize_bool(const void *field)
+{
+	return js_new_bool(*(const bool *)field);
+}
+
+static json_object *serialize_memory(const void *field)
+{
+	if (*(const int64_t *)field == -1)
+		return js_new_string("infinity");
+
+	return js_new_int(*(const int64_t *)field);
+}
+
+static json_object *serialize_strings(const void *field)
+{
+	const PtrArray *strings = field;
+	autofreejson json_object *result = js_new_array();
+	for (size_t i = 0; i < strings->length; i++)
+		js_array_add(result, js_new_string(strings->items[i]));
+	return steal_ptr(&result);
+}
+
+static const ConfigParser path_parser = {
+	.type = json_type_string,
+	.parse = parse_path,
+	.destroy = free,
+	.serialize = serialize_string,
+};
+static const ConfigParser hostname_parser = {
+	.type = json_type_string,
+	.parse = parse_hostname,
+	.destroy = free,
+	.serialize = serialize_string,
+};
+static const ConfigParser seat_parser = {
+	.type = json_type_string,
+	.parse = parse_seat,
+	.destroy = free,
+	.serialize = serialize_string,
+};
+static const ConfigParser ipv4_parser = {
+	.type = json_type_string,
+	.parse = parse_ipv4,
+	.destroy = free,
+	.serialize = serialize_string,
+};
+static const ConfigParser prefix_parser = {
+	.type = json_type_int,
+	.parse = parse_prefix_length,
+	.serialize = serialize_prefix_length,
+};
+static const ConfigParser userns_parser = {
+	.type = json_type_string,
+	.parse = parse_userns,
+	.serialize = serialize_userns,
+};
+static const ConfigParser bool_parser = {
+	.type = json_type_boolean,
+	.parse = parse_bool,
+	.serialize = serialize_bool,
+};
+static const ConfigParser memory_parser = {
+	.type = json_type_null,
+	.parse = parse_memory,
+	.serialize = serialize_memory,
+};
+static const ConfigParser strings_parser = {
+	.type = json_type_array,
+	.parse = append_string,
+	.destroy = free,
+	.serialize = serialize_strings,
+};
 
 static const ConfigEntry mount_entries[] = {
 	CONFIG_ENTRY(PathOperation, "source", source, path_parser, .required = true),
@@ -362,7 +470,7 @@ static void parse_device(void *field, json_object *value, const char *name,
 	parse_path_operation(field, value, true, name, filename);
 }
 
-static const char *const capability_names[] = {
+const char *const capability_names[] = {
 	"CAP_CHOWN",
 	"CAP_DAC_OVERRIDE",
 	"CAP_DAC_READ_SEARCH",
@@ -404,43 +512,73 @@ static const char *const capability_names[] = {
 	"CAP_PERFMON",
 	"CAP_BPF",
 	"CAP_CHECKPOINT_RESTORE",
+	NULL,
 };
 
-static void parse_capability(PtrArray *operations, json_object *value, bool remove,
-			     const char *field_name, const char *filename)
+static void parse_capability_name(void *field, json_object *value, const char *field_name,
+				  const char *filename)
 {
 	const char *name = config_string(value, field_name, filename);
-	bool all = !strcasecmp(name, "all"), found = false;
+	if (!strcasecmp(name, "all")) {
+		replace_string(field, xstrdup("all"));
+		return;
+	}
+
 	if (!strncasecmp(name, "CAP_", 4))
 		name += 4;
 
-	for (size_t i = 0; i < N_ELEMENTS(capability_names); i++) {
-		if (!all && strcasecmp(name, capability_names[i] + 4))
+	for (size_t i = 0; capability_names[i]; i++) {
+		if (strcasecmp(name, capability_names[i] + 4))
 			continue;
 
-		found = true;
-		CapabilityOperation *operation = xnew(CapabilityOperation);
-		*operation = (CapabilityOperation){
-			.name = capability_names[i],
-			.remove = remove,
-		};
-		ptr_array_add(operations, operation);
+		replace_string(field, xstrdup(capability_names[i]));
+		return;
 	}
 
-	if (!found)
-		errx(1, "%s: unknown capability: %s", filename, name);
+	errx(1, "%s: %s: unknown capability: %s", filename, field_name, name);
 }
 
-static void parse_add_capability(void *field, json_object *value, const char *name,
-				 const char *filename)
+static const ConfigParser capability_name_parser = {
+	.type = json_type_string,
+	.parse = parse_capability_name,
+	.destroy = free,
+	.serialize = serialize_string,
+};
+
+static const ConfigEntry capability_entries[] = {
+	CONFIG_ENTRY(CapabilityOperation, "name", name, capability_name_parser,
+		     .required = true),
+	CONFIG_ENTRY(CapabilityOperation, "remove", remove, bool_parser),
+};
+
+static void capability_operation_free(void *data)
 {
-	parse_capability(field, value, false, name, filename);
+	clear_object(data, capability_entries, N_ELEMENTS(capability_entries));
+	free(data);
 }
 
-static void parse_drop_capability(void *field, json_object *value, const char *name,
-				  const char *filename)
+static void append_capability(void *field, json_object *value, const char *name,
+			      const char *filename)
 {
-	parse_capability(field, value, true, name, filename);
+	CapabilityOperation *operation = xnew(CapabilityOperation);
+	*operation = (CapabilityOperation){0};
+	ptr_array_add(field, operation);
+
+	parse_object(operation, value, capability_entries, N_ELEMENTS(capability_entries),
+		     name, filename);
+}
+
+static json_object *serialize_capabilities(const void *field)
+{
+	const PtrArray *capabilities = field;
+	autofreejson json_object *result = js_new_array();
+	for (size_t i = 0; i < capabilities->length; i++) {
+		json_object *entry =
+			serialize_object(capabilities->items[i], capability_entries,
+					 N_ELEMENTS(capability_entries), false);
+		js_array_add(result, entry);
+	}
+	return steal_ptr(&result);
 }
 
 static void parse_unmask(void *field, json_object *value, const char *name,
@@ -456,21 +594,58 @@ static void parse_unmask(void *field, json_object *value, const char *name,
 	ptr_array_add(field, canonical);
 }
 
-static const ConfigParser mounts_parser = {json_type_array, parse_mount,
-					   path_operation_free};
-static const ConfigParser devices_parser = {json_type_array, parse_device,
-					    path_operation_free};
-static const ConfigParser add_caps_parser = {json_type_array, parse_add_capability, free};
-static const ConfigParser drop_caps_parser = {json_type_array, parse_drop_capability,
-					      free};
-static const ConfigParser unmask_parser = {json_type_array, parse_unmask, free};
+static json_object *serialize_path_operations(const void *field)
+{
+	const PtrArray *operations = field;
+	autofreejson json_object *result = js_new_array();
+	for (size_t i = 0; i < operations->length; i++) {
+		const PathOperation *operation = operations->items[i];
+		const ConfigEntry *entries = mount_entries;
+		size_t count = N_ELEMENTS(mount_entries);
+		if (operation->seat) {
+			entries = seat_entries;
+			count = N_ELEMENTS(seat_entries);
+		} else if (operation->device) {
+			entries = device_entries;
+			count = N_ELEMENTS(device_entries);
+		}
+
+		autofreejson json_object *entry =
+			serialize_object(operation, entries, count, false);
+		js_array_add(result, steal_ptr(&entry));
+	}
+	return steal_ptr(&result);
+}
+
+static const ConfigParser mounts_parser = {
+	.type = json_type_array,
+	.parse = parse_mount,
+	.destroy = path_operation_free,
+	.serialize = serialize_path_operations,
+};
+static const ConfigParser devices_parser = {
+	.type = json_type_array,
+	.parse = parse_device,
+	.destroy = path_operation_free,
+	.serialize = serialize_path_operations,
+};
+static const ConfigParser capabilities_parser = {
+	.type = json_type_array,
+	.parse = append_capability,
+	.destroy = capability_operation_free,
+	.serialize = serialize_capabilities,
+};
+static const ConfigParser unmask_parser = {
+	.type = json_type_array,
+	.parse = parse_unmask,
+	.destroy = free,
+	.serialize = serialize_strings,
+};
 
 static const ConfigEntry config_entries[] = {
 	CONFIG_ENTRY(Config, "base-config", base_config, path_parser),
 	CONFIG_ENTRY(Config, "hostname", hostname, hostname_parser),
 	CONFIG_ENTRY(Config, "rootfs", rootfs, path_parser),
-	CONFIG_ENTRY(Config, "etc-dir", etc_dir, path_parser),
-	CONFIG_ENTRY(Config, "var-dir", var_dir, path_parser),
 	CONFIG_ENTRY(Config, "seccomp", seccomp_file, path_parser),
 	CONFIG_ENTRY(Config, "resolv-conf", resolv_conf, path_parser),
 	CONFIG_ENTRY(Config, "ip", ip, ipv4_parser),
@@ -482,14 +657,16 @@ static const ConfigEntry config_entries[] = {
 		     .track_presence = true,
 		     .presence_offset = offsetof(Config, memory_max_set)),
 
-	/* These pairs share a target list; table order defines per-file precedence. */
-	CONFIG_ENTRY(Config, "mounts", path_operations, mounts_parser),
-	CONFIG_ENTRY(Config, "devices", path_operations, devices_parser),
-	CONFIG_ENTRY(Config, "drop-capabilities", capability_operations,
-		     drop_caps_parser),
-	CONFIG_ENTRY(Config, "add-capabilities", capability_operations, add_caps_parser),
+	CONFIG_ENTRY(Config, "mounts", mounts, mounts_parser),
+	CONFIG_ENTRY(Config, "devices", devices, devices_parser),
+	CONFIG_ENTRY(Config, "capabilities", capabilities, capabilities_parser),
 	CONFIG_ENTRY(Config, "unmask", unmask, unmask_parser),
 };
+
+json_object *configuration_serialize(const Config *config)
+{
+	return serialize_object(config, config_entries, N_ELEMENTS(config_entries), true);
+}
 
 void config_free(Config *config)
 {

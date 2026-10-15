@@ -98,7 +98,6 @@ class ExecTests(unittest.TestCase):
         cases = [
             (["exec"], "exec requires a command"),
             (["exec", "--"], "exec requires a command"),
-            (["exec", "--prepare-only", "/bin/bash"], "--prepare-only is not supported by exec"),
             (["cleanup", "exec", "/bin/bash"], "cleanup takes no positional arguments"),
             (["cleanup", "--hostname", "qm"], "unrecognized option"),
             (["unknown"], "unknown command"),
@@ -110,17 +109,59 @@ class ExecTests(unittest.TestCase):
                 self.assertIn(message, result.stderr)
 
     def test_help_and_missing_command(self):
-        for command in ([], ["launch"], ["exec"], ["cleanup"], ["update-resolv-conf"]):
-            with self.subTest(command=command):
-                result = subprocess.run([str(LAUNCHER), *command, "--help"],
-                                        text=True, capture_output=True)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("qmc launch", result.stdout)
-                self.assertIn("qmc exec", result.stdout)
-                self.assertIn("qmc cleanup", result.stdout)
+        result = subprocess.run([str(LAUNCHER), "--help"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ("exec", "inspect"):
+            self.assertIn(f"\n  {command} ", result.stdout)
+        for internal in ("launch", "cleanup", "update-resolv-conf"):
+            self.assertNotIn(internal, result.stdout)
+        self.assertIn("qmc COMMAND --help", result.stdout)
+        self.assertNotIn("--config", result.stdout)
+
         result = subprocess.run([str(LAUNCHER)], text=True, capture_output=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("Usage: qmc", result.stderr)
+
+    def test_command_help(self):
+        common = {"--runtime-dir", "--verbose", "--help"}
+        commands = {
+            "exec": set(),
+            "inspect": {"--config", "--oci", "--field"},
+            "launch": {"--config", "--prepare-only"},
+            "cleanup": set(),
+            "update-resolv-conf": {"--config"},
+        }
+        for command, options in commands.items():
+            with self.subTest(command=command):
+                result = subprocess.run([str(LAUNCHER), command, "--help"],
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith(f"Usage: qmc {command} [OPTIONS]"))
+                self.assertEqual(result.stderr, "")
+                listed = {line.split()[0] for line in result.stdout.splitlines()
+                          if line.startswith("  --")}
+                self.assertEqual(listed, common | options)
+                self.assertEqual("\nConfiguration:" in result.stdout, "--config" in options)
+                for other in commands.keys() - {command}:
+                    self.assertNotIn(f"qmc {other} ", result.stdout)
+
+    def test_command_specific_options(self):
+        cases = {
+            "exec": ["--config", "--prepare-only", "--oci", "--field"],
+            "inspect": ["--prepare-only"],
+            "launch": ["--oci", "--field"],
+            "cleanup": ["--config", "--prepare-only", "--oci", "--field"],
+            "update-resolv-conf": ["--prepare-only", "--oci", "--field"],
+        }
+        for command, options in cases.items():
+            for option in options:
+                with self.subTest(command=command, option=option):
+                    result = subprocess.run(self.command(command, option),
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(f"unrecognized option '{option}'", result.stderr)
+                    self.assertIn(f"Usage: qmc {command} [OPTIONS]", result.stderr)
 
     @unittest.skipUnless(PRIVATE_CRUN, "requires the smoke test's private crun mount")
     def test_exec_missing_crun_preserves_state(self):

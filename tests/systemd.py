@@ -16,6 +16,7 @@ import tempfile
 
 SOURCE = pathlib.Path(__file__).resolve().parent.parent
 LAUNCHER = pathlib.Path(sys.argv[1]).resolve()
+VENDOR = json.loads((SOURCE / "qmc.conf.in").read_text())
 MACHINE_ID_STATE = sys.argv[2] if len(sys.argv) > 2 else "existing"
 HOST_MACHINE_ID = pathlib.Path("/etc/machine-id").read_text().strip()
 
@@ -60,20 +61,20 @@ with tempfile.TemporaryDirectory(prefix="qm-systemd-") as temporary:
     config["linux"].pop("mountLabel")
     config["linux"].pop("sysctl")
     config["linux"]["resources"] = {"devices": []}
-    config["mounts"] = [m for m in config["mounts"] if m["destination"] not in
-                        ("/var", "/var/tmp", "/sys/fs/selinux")]
+    config["mounts"] = [m for m in config["mounts"]
+                        if m["destination"] != "/sys/fs/selinux"]
     config["mounts"] += [
         {"destination": "/usr", "source": "/usr", "type": "bind", "options": ["rbind", "ro"]},
     ]
     for mount in config["mounts"]:
-        if mount["destination"] == "/etc":
-            mount["source"] = str(etc)
-        elif mount.get("type") == "devpts":
+        if mount.get("type") == "devpts":
             mount["options"] = ["gid=0" if o == "gid=5" else o for o in mount["options"]]
     base = directory / "base.json"
     base.write_text(json.dumps(config))
     filename = directory / "qmc.conf"
     filename.write_text(json.dumps({"base-config": str(base), "userns": "off",
+                                  "capabilities": VENDOR["capabilities"],
+                                  "mounts": [{"source": str(etc), "destination": "/etc"}],
                                   "seccomp": str(SOURCE / "tests/seccomp-no-rt.json")}))
     runtime = directory / "runtime"
 

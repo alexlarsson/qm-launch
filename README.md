@@ -26,9 +26,14 @@ for runtime files. When set, `RUNTIME_DIRECTORY` supplies the runtime path;
 systemd sets it from the service's `RuntimeDirectory` setting. `--runtime-dir`
 overrides that path. The launcher sets up QM networking using the configured
 IPv4 addresses.
-Use `qmc launch` to start QM, `qmc exec` to run a command inside it,
-`qmc cleanup` to remove its runtime state, and `qmc update-resolv-conf` to
-refresh its DNS and hosts files. Options follow the subcommand.
+Use `qmc exec` to run a command inside QM and `qmc inspect` to examine its
+configuration.
+The service uses the internal `launch` and `cleanup` commands to manage QM's
+lifetime, and `update-resolv-conf` to refresh its DNS and hosts files.
+These commands are hidden from the top-level help. Each command's `--help`
+describes its own options, and each command accepts only those options.
+Options follow the subcommand, for example `qmc inspect --help` or
+`qmc exec --verbose /bin/bash`.
 
 Container settings come from JSON configuration files, loaded in this order:
 
@@ -45,9 +50,9 @@ filename in both directories are both read. Sorting uses byte order, independent
 of the host locale. Files with other suffixes are ignored. Invalid JSON, unknown
 keys and incorrect value types cause an error identifying the file.
 
-The installed vendor configuration supplies QM's paths and enables verbose
-logging. To customize the hostname and disable debug logging, for example,
-create `/etc/qmc.conf.d/50-local.conf` containing:
+The installed vendor configuration supplies QM's paths and default capabilities
+and enables verbose logging. To customize the hostname and disable debug logging,
+for example, create `/etc/qmc.conf.d/50-local.conf` containing:
 
 ```json
 {
@@ -55,6 +60,41 @@ create `/etc/qmc.conf.d/50-local.conf` containing:
   "verbose": false
 }
 ```
+
+Inspect the merged settings without starting QM or writing runtime files:
+
+```sh
+qmc inspect
+qmc inspect --field rootfs
+```
+
+This reads the same configuration layers as startup; `--config FILE` selects a
+standalone file. The output uses the `qmc.conf` format, including defaults,
+with separate `mounts`, `devices` and `capabilities` lists. Entries retain
+their load order within each list. Memory limits are
+printed as bytes or `"infinity"`; the derived subnet is omitted. The output can
+be saved and used with `--config`.
+
+If `rootfs` has no override, inspection reads it from the OCI base configuration.
+Device selections, seccomp profiles and user namespace mappings are not resolved
+during inspection.
+
+Read the OCI configuration saved by the latest launch or `--prepare-only` run:
+
+```sh
+qmc inspect --oci
+qmc inspect --oci --field /linux/devices
+```
+
+`--oci` reads `config.json` from the runtime directory without loading the current
+configuration, so it also works after configuration files have changed or become
+invalid. It fails if no saved bundle exists. `--runtime-dir` and
+`RUNTIME_DIRECTORY` select the bundle as for `exec`; `--config` cannot be combined
+with `--oci`.
+
+`--field` accepts a top-level key or a JSON pointer such as `/root/path`.
+Strings are printed without JSON quotes; other values remain JSON. Missing
+fields cause an error. Without `--field`, inspection prints the whole JSON object.
 
 Supported keys are:
 
@@ -66,8 +106,6 @@ Supported keys are:
 | `gateway` | Host veth IPv4 address (default `10.90.0.1`) |
 | `prefix-length` | JSON integer from 1 to 31 (default `24`) |
 | `rootfs` | Absolute path overriding the OCI root filesystem |
-| `etc-dir` | Absolute path overriding the `/etc` bind source |
-| `var-dir` | Absolute path overriding the `/var` bind source, with `/var/tmp` at its `tmp` subdirectory |
 | `seccomp` | Absolute path to an OCI or containers-style seccomp JSON file |
 | `resolv-conf` | Absolute path to the host resolver file; otherwise select the available host resolver automatically |
 | `userns` | `auto` (default), `off`, or `required` |
@@ -75,8 +113,7 @@ Supported keys are:
 | `memory-max` | Payload memory limit: positive integer bytes, a size string such as `"5G"`, or `"infinity"` |
 | `mounts` | Ordered array of bind mount additions, replacements and removals |
 | `devices` | Ordered array of device additions, replacements and removals |
-| `add-capabilities` | Array of capabilities to add to bounding, effective and permitted sets |
-| `drop-capabilities` | Array of capabilities to remove from all capability sets |
+| `capabilities` | Ordered array of objects with a capability `name` and optional boolean `remove` (default false) |
 | `unmask` | Array of container paths to remove from masked and readonly path lists, or `["ALL"]` |
 
 Addresses, paths and mode values are strings. IP and gateway must be distinct
@@ -91,11 +128,27 @@ usable addresses in the same subnet; the subnet is derived from `ip` and
 }
 ```
 
-Without path overrides, the OCI base
-configuration supplies the root filesystem and bind sources. Without `seccomp`,
-the base configuration must contain an inline filter. The installed vendor file
-sets `rootfs` to `/usr/lib/qm/rootfs`, `etc-dir` to `/etc/qm`, `var-dir` to
-`/var/qm`, and `seccomp` to `/usr/share/qm/seccomp-no-rt.json`.
+The root filesystem path must come from `rootfs` or the OCI base configuration.
+The installed vendor file sets `rootfs` to `/usr/lib/qm/rootfs`; the shipped
+`qm.json` keeps the root's read-only policy and leaves its path to configuration.
+The vendor file also sets `seccomp` to `/usr/share/qm/seccomp-no-rt.json`.
+Without `seccomp`, the base configuration must contain an inline filter.
+
+The writable binds from `/etc/qm` to `/etc`, `/var/qm` to `/var`, and
+`/var/qm/tmp` to `/var/tmp` are ordinary entries in the vendor configuration's
+`mounts` list. They are absent from the shipped OCI base and can be replaced or
+removed by later mount operations. Each source is independent. To relocate all
+three, for example, add a drop-in containing:
+
+```json
+{
+  "mounts": [
+    {"source": "/srv/qm/etc", "destination": "/etc"},
+    {"source": "/srv/qm/var", "destination": "/var"},
+    {"source": "/srv/qm/var/tmp", "destination": "/var/tmp"}
+  ]
+}
+```
 
 The vendor configuration also supplies optional `/dev/kvm` and `/dev/fuse`
 devices and an optional read-only host `/etc/localtime` bind mount. These are
@@ -105,11 +158,13 @@ instead of QM's additional realtime scheduling restrictions, set `seccomp`
 to `/usr/share/containers/seccomp.json`.
 
 Mount objects have absolute `source` and `destination` paths, an optional
-boolean `optional` (default false), and an optional `options` array of mount
-flags. Default options are `["rbind", "rprivate"]`; explicit options replace
-that list. Device objects have an absolute `source`, an optional `destination`
-(defaulting to the source), and an optional boolean `optional`. Character and
-block devices are added as OCI device nodes with the source's major/minor,
+boolean `optional` (default false), and an optional `options` array of additional
+mount flags. `qmc` always appends `rbind` and `rprivate` when generating the OCI
+configuration, including when `options` is omitted or empty; these flags need
+not be listed in the configuration. Device objects have an absolute `source`, an
+optional `destination` (defaulting to the source), and an optional boolean
+`optional`. Character and block devices are added as OCI device nodes with the
+source's major/minor,
 permission bits, UID and GID, plus a matching `rwm` device cgroup permission.
 The runtime creates the nodes using the container's user namespace mappings.
 Use `mounts` when a device bind mount is wanted instead.
@@ -158,15 +213,16 @@ seat. To retain those additions, list them explicitly alongside the seat selecto
 }
 ```
 
-Container destination is the identity for mounts and devices. Later entries
-replace earlier requests at that destination, including entries of the other
-kind. An object with `"remove": true` requires only `destination` and `remove`;
-it removes the mount/device at that destination, and a later addition can restore
+Container destination is the identity for mounts and devices. Within each list,
+later entries replace earlier requests at that destination. An object with
+`"remove": true` requires only `destination` and `remove`; it removes the
+mount/device at that destination, and a later addition in the same list can restore
 it. Replaced requests are discarded before probing their sources. Device directories
-and globs expand into individual destinations, which later entries can override or
-remove. Device access is granted after resolving these operations. Within each
-configuration file, mount entries precede device entries,
-independent of JSON key order. Existing OCI mounts are replaced in place; new
+and globs expand into individual destinations, which later device entries can override
+or remove. Each list accumulates across all configuration files before OCI generation;
+mounts are applied first, then devices. Device entries therefore take precedence at
+overlapping destinations regardless of drop-in order. Device access is granted after
+resolving these operations. Existing OCI mounts are replaced in place; new
 mounts are appended in first-destination order, so place parent mounts before
 their children. For example, `/etc/qmc.conf.d/50-workload.conf` could contain:
 
@@ -184,18 +240,19 @@ their children. For example, `/etc/qmc.conf.d/50-workload.conf` could contain:
     {
       "source": "/var/lib/shared",
       "destination": "/var/lib/shared",
-      "options": ["rbind", "rprivate", "ro"]
+      "options": ["ro"]
     }
   ],
-  "add-capabilities": ["CAP_SYS_RESOURCE"]
+  "capabilities": [{"name": "CAP_SYS_RESOURCE"}]
 }
 ```
 
 Configuration paths are normalized lexically: repeated slashes, trailing slashes,
 and `.` or `..` components are resolved without filesystem access or following
 symlinks. Mount/device destinations `/`, `/etc/hosts`, `/etc/hostname`,
-`/etc/resolv.conf`, `/run/.containerenv` and `/run/secrets` are reserved. Explicit mount/device
-entries take precedence over `etc-dir` and `var-dir` mount source overrides.
+`/etc/resolv.conf`, `/run/.containerenv` and `/run/secrets` are reserved. Parent
+mounts are inserted before existing child mounts so binds such as `/etc/hosts`
+remain visible when adding `/etc`.
 
 `memory-max` sets `linux.resources.memory.limit` on the `payload` cgroup,
 including nested containers. It leaves the sibling `supervisor` cgroup alone;
@@ -205,15 +262,33 @@ payload limit. Size strings use binary units `K`, `M`, `G`, `T`, `P` or `E`,
 optionally followed by `B` or `iB`; `"5G"` means 5 × 1024³ bytes. Zero, negative,
 fractional and overflowing values are rejected.
 
-Capability names are case-insensitive, with an optional `CAP_` prefix; `all`
-expands to the capabilities known to the launcher. Within a file, drops precede
-additions, so an addition wins when both name the same capability. Across files,
-operations follow configuration load order. Changes are applied before resolving
-capability-dependent seccomp rules. `unmask` removes exact paths from both OCI
+Capability entries require a `name`; `remove` defaults to false. Additions affect
+the bounding, effective and permitted sets; removals affect all five capability
+sets. Names are case-insensitive, with an optional `CAP_` prefix. The special name
+`all` adds every capability known to the launcher, or clears all five sets when
+used with `remove: true`. Inspection preserves this selector without expanding it.
+The vendor `qmc.conf` starts with `all`, then removes `CAP_SYS_BOOT` and
+`CAP_SYS_RESOURCE`; the base OCI JSON contains no capability list.
+
+Entries accumulate across configuration files and are applied in list order, so
+a later entry can remove an earlier addition or add a capability back after
+removal. For example:
+
+```json
+{
+  "capabilities": [
+    {"name": "all", "remove": true},
+    {"name": "CAP_SYS_RESOURCE"}
+  ]
+}
+```
+
+Changes are applied before resolving capability-dependent seccomp rules.
+`unmask` removes exact paths from both OCI
 `maskedPaths` and `readonlyPaths`; it does not change explicit read-only mounts.
 
 `qmc.service` runs `qmc launch`; container settings no longer require editing
-its command line. `--config FILE` on `launch` or `update-resolv-conf` loads
+its command line. `--config FILE` on `launch`, `inspect` or `update-resolv-conf` loads
 only that file instead of the standard layers. Launch no longer takes a positional
 OCI config argument. `--runtime-dir` and `--prepare-only` remain command-line
 options and are rejected as configuration keys. `--verbose` remains available

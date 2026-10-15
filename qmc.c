@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <json-c/json.h>
+#include <json-c/json_pointer.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -43,6 +44,7 @@
 typedef enum {
 	COMMAND_LAUNCH,
 	COMMAND_EXEC,
+	COMMAND_INSPECT,
 	COMMAND_CLEANUP,
 	COMMAND_UPDATE_RESOLV_CONF,
 } Command;
@@ -51,6 +53,8 @@ static const char *opt_runtime_dir = DEFAULT_RUNTIME_DIR;
 static const char *opt_config_file;
 static bool opt_verbose;
 static bool opt_prepare_only;
+static bool opt_inspect_oci;
+static const char *opt_inspect_field;
 static char **opt_exec_argv; /* Borrowed from main's argv, NULL-terminated. */
 
 static void debug(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -508,20 +512,6 @@ static void override_mount_source(json_object *config, const char *destination,
 		js_set_string(mount, "source", source);
 }
 
-static void override_paths(json_object *config, const Config *configuration)
-{
-	if (configuration->rootfs)
-		js_set_string(js_need(config, "root", json_type_object), "path",
-			      configuration->rootfs);
-
-	override_mount_source(config, "/etc", configuration->etc_dir);
-	override_mount_source(config, "/var", configuration->var_dir);
-	if (configuration->var_dir) {
-		autofree char *tmp = join_path(configuration->var_dir, "tmp");
-		override_mount_source(config, "/var/tmp", tmp);
-	}
-}
-
 static void configure_mounts(json_object *config, const char *files)
 {
 	const struct {
@@ -651,7 +641,9 @@ static json_object *create_config(const Config *configuration)
 {
 	debug("Loading OCI configuration from %s", configuration->base_config);
 	autofreejson json_object *config = js_load(configuration->base_config);
-	override_paths(config, configuration);
+	if (configuration->rootfs)
+		js_set_string(js_need(config, "root", json_type_object), "path",
+			      configuration->rootfs);
 
 	json_object *linux_config = js_need(config, "linux", json_type_object);
 	json_object *process = js_need(config, "process", json_type_object);
@@ -787,7 +779,10 @@ static void write_container_files(const Config *configuration, json_object *conf
 	js_set_string(hosts_config, "gateway", configuration->gateway);
 	js_object_add(hosts_config, "prefix-length",
 		      js_new_int(configuration->prefix_length));
-	container_file(files, "hosts.conf", json_object_to_json_string(hosts_config),
+	container_file(files, "hosts.conf",
+		       json_object_to_json_string_ext(
+			       hosts_config,
+			       JSON_C_TO_STRING_SPACED | JSON_C_TO_STRING_NOSLASHESCAPE),
 		       context);
 
 	autofree char *dns = try_read_text_file(configuration->resolv_conf);
@@ -815,36 +810,248 @@ static void write_bundle(const Config *configuration, json_object *config)
 	js_save(config, oci_config);
 }
 
+static json_object *inspect_settings(const Config *configuration)
+{
+	autofreejson json_object *result = configuration_serialize(configuration);
+	if (!configuration->rootfs) {
+		autofreejson json_object *base = js_load(configuration->base_config);
+		js_set_string(result, "rootfs",
+			      js_string(js_need(base, "root", json_type_object), "path"));
+	}
+	return steal_ptr(&result);
+}
+
+static int inspect(const Config *configuration)
+{
+	autofreejson json_object *object = NULL;
+	if (opt_inspect_oci) {
+		autofree char *filename = join_path(opt_runtime_dir, "config.json");
+		object = js_load(filename);
+	} else {
+		object = inspect_settings(configuration);
+	}
+
+	json_object *value = object;
+	if (opt_inspect_field) {
+		bool found;
+		if (opt_inspect_field[0] == '/')
+			found = json_pointer_get(object, opt_inspect_field, &value) == 0;
+		else
+			found = json_object_object_get_ex(object, opt_inspect_field, &value);
+		if (!found)
+			errx(1, "unknown inspection field: %s", opt_inspect_field);
+	}
+
+	const char *contents;
+	size_t length;
+	if (opt_inspect_field && json_object_is_type(value, json_type_string)) {
+		contents = json_object_get_string(value);
+		length = json_object_get_string_len(value);
+	} else {
+		contents = json_object_to_json_string_ext(
+			value, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
+		if (!contents)
+			oom();
+		length = strlen(contents);
+	}
+
+	write_all(STDOUT_FILENO, contents, length);
+	write_all(STDOUT_FILENO, "\n", 1);
+	return 0;
+}
+
+enum {
+	OPTION_RUNTIME_DIR = 1 << 0,
+	OPTION_CONFIG = 1 << 1,
+	OPTION_VERBOSE = 1 << 2,
+	OPTION_PREPARE_ONLY = 1 << 3,
+	OPTION_OCI = 1 << 4,
+	OPTION_FIELD = 1 << 5,
+	OPTION_HELP = 1 << 6,
+
+	COMMON_OPTIONS = OPTION_RUNTIME_DIR | OPTION_VERBOSE | OPTION_HELP,
+};
+
+typedef struct {
+	struct option option;
+	const char *argument;
+	const char *description;
+} OptionInfo;
+
+/* Option values also serve as bits in each command's option set. */
+static const OptionInfo options[] = {
+	{{"runtime-dir", required_argument, NULL, OPTION_RUNTIME_DIR},
+	 "DIR",
+	 "Runtime files (default " DEFAULT_RUNTIME_DIR ")\n"
+	 "                        RUNTIME_DIRECTORY overrides the default"},
+	{{"config", required_argument, NULL, OPTION_CONFIG},
+	 "FILE",
+	 "Use only this JSON configuration file"},
+	{{"verbose", no_argument, NULL, OPTION_VERBOSE},
+	 NULL,
+	 "Enable launcher and crun debug logging"},
+	{{"prepare-only", no_argument, NULL, OPTION_PREPARE_ONLY},
+	 NULL,
+	 "Write bundle without setup"},
+	{{"oci", no_argument, NULL, OPTION_OCI}, NULL, "Inspect the saved OCI bundle"},
+	{{"field", required_argument, NULL, OPTION_FIELD},
+	 "KEY",
+	 "Print one field, as a key or JSON pointer\n"
+	 "                        Strings are printed without quotes"},
+	{{"help", no_argument, NULL, OPTION_HELP}, NULL, "Show this help"},
+};
+
+typedef struct {
+	Command command;
+	const char *name;
+	const char *arguments;
+	const char *description;
+	unsigned options;
+	bool internal;
+} CommandInfo;
+
+static const CommandInfo commands[] = {
+	{
+		.command = COMMAND_EXEC,
+		.name = "exec",
+		.arguments = " [--] COMMAND [ARG...]",
+		.description = "Run a command in the running container",
+		.options = COMMON_OPTIONS,
+	},
+	{
+		.command = COMMAND_INSPECT,
+		.name = "inspect",
+		.arguments = "",
+		.description = "Show merged settings or saved OCI configuration",
+		.options = COMMON_OPTIONS | OPTION_CONFIG | OPTION_OCI | OPTION_FIELD,
+	},
+	{
+		.command = COMMAND_LAUNCH,
+		.name = "launch",
+		.arguments = "",
+		.description = "Prepare and start the QM container",
+		.options = COMMON_OPTIONS | OPTION_CONFIG | OPTION_PREPARE_ONLY,
+		.internal = true,
+	},
+	{
+		.command = COMMAND_CLEANUP,
+		.name = "cleanup",
+		.arguments = "",
+		.description = "Delete container and tear down networking",
+		.options = COMMON_OPTIONS,
+		.internal = true,
+	},
+	{
+		.command = COMMAND_UPDATE_RESOLV_CONF,
+		.name = "update-resolv-conf",
+		.arguments = "",
+		.description = "Update DNS and hosts files in place",
+		.options = COMMON_OPTIONS | OPTION_CONFIG,
+		.internal = true,
+	},
+};
+
 static void usage(FILE *output)
 {
-	fprintf(output,
-		"Usage: qmc launch [OPTIONS]\n"
-		"       qmc exec [OPTIONS] [--] COMMAND [ARG...]\n"
-		"       qmc cleanup [OPTIONS]\n"
-		"       qmc update-resolv-conf [OPTIONS]\n\n"
-		"Commands:\n"
-		"  launch                Prepare and start the QM container\n"
-		"  exec                  Run a command in the running container\n"
-		"  cleanup               Delete container and tear down networking\n"
-		"  update-resolv-conf    Update DNS and hosts files in place\n\n"
-		"Options (after the command):\n"
-		"  --runtime-dir DIR     Runtime files (default %s)\n"
-		"                        RUNTIME_DIRECTORY overrides the default\n"
-		"  --config FILE         Use only this JSON configuration file\n"
-		"                        (launch and update-resolv-conf only)\n"
-		"  --verbose             Enable launcher and crun debug logging\n"
-		"  --prepare-only        Write bundle without setup (launch only)\n"
-		"  --help                Show this help\n\n"
-		"Configuration: %s/qmc.conf, %s/qmc.conf.d/*.conf,\n"
-		"               %s/qmc.conf, %s/qmc.conf.d/*.conf (in order).\n",
-		DEFAULT_RUNTIME_DIR, QM_DATA_DIR, QM_DATA_DIR, QM_CONFIG_DIR,
-		QM_CONFIG_DIR);
+	fputs("Usage: qmc COMMAND [OPTIONS]...\n"
+	      "       qmc --help\n\n"
+	      "Commands:\n",
+	      output);
+	for (size_t i = 0; i < N_ELEMENTS(commands); i++) {
+		if (!commands[i].internal)
+			fprintf(output, "  %-22s%s\n", commands[i].name,
+				commands[i].description);
+	}
+
+	fputs("\nRun 'qmc COMMAND --help' for command-specific options.\n", output);
+}
+
+static void command_usage(FILE *output, const CommandInfo *command)
+{
+	fprintf(output, "Usage: qmc %s [OPTIONS]%s\n\n%s\n\nOptions:\n", command->name,
+		command->arguments, command->description);
+	for (size_t i = 0; i < N_ELEMENTS(options); i++) {
+		const OptionInfo *option = &options[i];
+		if (!(command->options & option->option.val))
+			continue;
+
+		autofree char *name = xasprintf("--%s%s%s", option->option.name,
+						option->argument ? " " : "",
+						option->argument ? option->argument : "");
+		fprintf(output, "  %-22s%s\n", name, option->description);
+	}
+
+	if (command->options & OPTION_CONFIG)
+		fprintf(output,
+			"\nConfiguration: %s/qmc.conf, %s/qmc.conf.d/*.conf,\n"
+			"               %s/qmc.conf, %s/qmc.conf.d/*.conf (in order).\n",
+			QM_DATA_DIR, QM_DATA_DIR, QM_CONFIG_DIR, QM_CONFIG_DIR);
 }
 
 static void require_absolute_path(const char *option, const char *path)
 {
 	if (path && path[0] != '/')
 		errx(1, "%s must be an absolute path: %s", option, path);
+}
+
+static void parse_command_options(const CommandInfo *command, int argc, char **argv)
+{
+	const char *runtime_dir = getenv("RUNTIME_DIRECTORY");
+	if (runtime_dir && *runtime_dir)
+		opt_runtime_dir = runtime_dir;
+
+	struct option long_options[N_ELEMENTS(options) + 1] = {0};
+	size_t n_options = 0;
+	for (size_t i = 0; i < N_ELEMENTS(options); i++) {
+		if (command->options & options[i].option.val)
+			long_options[n_options++] = options[i].option;
+	}
+
+	/* Options follow the subcommand. Stop at the first positional argument,
+	 * so options belonging to an exec command are forwarded unchanged.
+	 */
+	optind = 1;
+	int option;
+	while ((option = getopt_long(argc, argv, "+", long_options, NULL)) != -1) {
+		switch (option) {
+		case OPTION_CONFIG:
+			opt_config_file = optarg;
+			break;
+		case OPTION_RUNTIME_DIR:
+			opt_runtime_dir = optarg;
+			break;
+		case OPTION_VERBOSE:
+			opt_verbose = true;
+			break;
+		case OPTION_PREPARE_ONLY:
+			opt_prepare_only = true;
+			break;
+		case OPTION_OCI:
+			opt_inspect_oci = true;
+			break;
+		case OPTION_FIELD:
+			opt_inspect_field = optarg;
+			break;
+		case OPTION_HELP:
+			command_usage(stdout, command);
+			exit(0);
+		default:
+			command_usage(stderr, command);
+			exit(2);
+		}
+	}
+
+	require_absolute_path("--runtime-dir", opt_runtime_dir);
+	if (opt_inspect_oci && opt_config_file)
+		errx(2, "--oci cannot be combined with --config");
+
+	if (command->command == COMMAND_EXEC) {
+		opt_exec_argv = argv + optind;
+		if (!opt_exec_argv[0] || !*opt_exec_argv[0])
+			errx(2, "exec requires a command");
+	} else if (optind != argc) {
+		errx(2, "%s takes no positional arguments", command->name);
+	}
 }
 
 static Command parse_options(int argc, char **argv)
@@ -857,94 +1064,35 @@ static Command parse_options(int argc, char **argv)
 		usage(stdout);
 		exit(0);
 	}
-	Command command;
-	if (!strcmp(argv[1], "launch"))
-		command = COMMAND_LAUNCH;
-	else if (!strcmp(argv[1], "exec"))
-		command = COMMAND_EXEC;
-	else if (!strcmp(argv[1], "cleanup"))
-		command = COMMAND_CLEANUP;
-	else if (!strcmp(argv[1], "update-resolv-conf"))
-		command = COMMAND_UPDATE_RESOLV_CONF;
-	else
-		errx(2, "unknown command: %s (see qmc --help)", argv[1]);
 
-	const char *runtime_dir = getenv("RUNTIME_DIRECTORY");
-	if (runtime_dir && *runtime_dir)
-		opt_runtime_dir = runtime_dir;
-
-	static const struct option long_options[] = {
-		{"config", required_argument, NULL, 'c'},
-		{"runtime-dir", required_argument, NULL, 'r'},
-		{"verbose", no_argument, NULL, 'V'},
-		{"prepare-only", no_argument, NULL, 'p'},
-		{"help", no_argument, NULL, 'h'},
-		{NULL, 0, NULL, 0}};
-
-	/* Options follow the subcommand. Stop at the first positional argument,
-	 * so options belonging to an exec command are forwarded unchanged.
-	 */
-	optind = 2;
-	int option, option_index;
-	while ((option = getopt_long(argc, argv, "+", long_options, &option_index)) !=
-	       -1) {
-		if (option == '?') {
-			usage(stderr);
-			exit(2);
-		}
-		if ((option == 'p' && command != COMMAND_LAUNCH) ||
-		    (option == 'c' && command != COMMAND_LAUNCH &&
-		     command != COMMAND_UPDATE_RESOLV_CONF))
-			errx(2, "--%s is not supported by %s",
-			     long_options[option_index].name, argv[1]);
-		switch (option) {
-		case 'c':
-			opt_config_file = optarg;
-			break;
-		case 'r':
-			opt_runtime_dir = optarg;
-			break;
-		case 'V':
-			opt_verbose = true;
-			break;
-		case 'p':
-			opt_prepare_only = true;
-			break;
-		case 'h':
-			usage(stdout);
-			exit(0);
-		default:
-			usage(stderr);
-			exit(2);
+	for (size_t i = 0; i < N_ELEMENTS(commands); i++) {
+		if (!strcmp(argv[1], commands[i].name)) {
+			parse_command_options(&commands[i], argc - 1, argv + 1);
+			return commands[i].command;
 		}
 	}
 
-	require_absolute_path("--runtime-dir", opt_runtime_dir);
-
-	if (command == COMMAND_EXEC) {
-		opt_exec_argv = argv + optind;
-		if (!opt_exec_argv[0] || !*opt_exec_argv[0])
-			errx(2, "exec requires a command");
-		return command;
-	}
-
-	if (optind != argc)
-		errx(2, "%s takes no positional arguments", argv[1]);
-	return command;
+	errx(2, "unknown command: %s (see qmc --help)", argv[1]);
 }
 
 int main(int argc, char **argv)
 {
 	const Command command = parse_options(argc, argv);
 
-	/* Recovery and exec must work even if the launch configuration is broken. */
+	/* Operations on existing runtime state must work even if the launch
+	 * configuration is broken.
+	 */
 	if (command == COMMAND_EXEC)
 		return exec_in_container();
 	if (command == COMMAND_CLEANUP)
 		return cleanup(opt_runtime_dir);
+	if (command == COMMAND_INSPECT && opt_inspect_oci)
+		return inspect(NULL);
 
 	autofreeconfig Config *configuration =
 		configuration_load(QM_DATA_DIR, QM_CONFIG_DIR, opt_config_file);
+	if (command == COMMAND_INSPECT)
+		return inspect(configuration);
 	opt_verbose |= configuration->verbose;
 	if (command == COMMAND_UPDATE_RESOLV_CONF)
 		return update_resolv_conf(configuration);

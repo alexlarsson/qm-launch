@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include "qm-utils.h"
 
+#include <assert.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -313,6 +314,21 @@ void js_array_add(json_object *array, json_object *value)
 		oom();
 }
 
+void js_array_insert(json_object *array, size_t index, json_object *value)
+{
+	size_t length = json_object_array_length(array);
+	assert(index <= length);
+
+	js_array_add(array, NULL);
+	for (size_t i = length; i > index; i--) {
+		json_object *item = json_object_array_get_idx(array, i - 1);
+		if (json_object_array_put_idx(array, i, json_object_get(item)) < 0)
+			oom();
+	}
+	if (json_object_array_put_idx(array, index, value) < 0)
+		oom();
+}
+
 json_object *js_get(json_object *object, const char *key)
 {
 	json_object *value = NULL;
@@ -368,8 +384,8 @@ void js_save(json_object *object, const char *filename)
 	if (!object)
 		errx(1, "%s: cannot write a null JSON object", filename);
 
-	const char *contents =
-		json_object_to_json_string_ext(object, JSON_C_TO_STRING_PRETTY);
+	const char *contents = json_object_to_json_string_ext(
+		object, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
 	if (!contents)
 		oom();
 
@@ -378,8 +394,8 @@ void js_save(json_object *object, const char *filename)
 
 void js_save_atomic(json_object *object, const char *filename, bool replace)
 {
-	const char *contents =
-		json_object_to_json_string_ext(object, JSON_C_TO_STRING_PRETTY);
+	const char *contents = json_object_to_json_string_ext(
+		object, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
 	if (!contents)
 		oom();
 	autofree char *temporary = xasprintf("%s.XXXXXX", filename);
