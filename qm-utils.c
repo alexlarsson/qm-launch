@@ -71,6 +71,27 @@ char *xasprintf(const char *format, ...)
 	return result;
 }
 
+void strv_builder_add(StrvBuilder *builder, const char *string)
+{
+	if (builder->length + 1 >= builder->capacity) {
+		size_t capacity = builder->capacity ? builder->capacity * 2 : 8;
+		if (capacity <= builder->capacity ||
+		    capacity > SIZE_MAX / sizeof(*builder->strv))
+			oom();
+		builder->strv =
+			xrealloc(builder->strv, capacity * sizeof(*builder->strv));
+		builder->capacity = capacity;
+	}
+	builder->strv[builder->length++] = (char *)string;
+	builder->strv[builder->length] = NULL;
+}
+
+void strv_builder_clear(StrvBuilder *builder)
+{
+	free(builder->strv);
+	*builder = (StrvBuilder){0};
+}
+
 bool starts_with(const char *string, const char *prefix)
 {
 	return strncmp(string, prefix, strlen(prefix)) == 0;

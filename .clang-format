@@ -11,4 +11,4 @@ AllowShortLoopsOnASingleLine: false
 BinPackArguments: true
 BinPackParameters: true
 ForEachMacros: [json_object_object_foreach]
-AttributeMacros: [autofree, autoclose, autofreejson]
+AttributeMacros: [autofree, autoclose, autofreejson, autofreestrvbuilder]

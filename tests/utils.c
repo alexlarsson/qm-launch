@@ -90,6 +90,25 @@ pid_t __wrap_fork(void)
 
 int main(void)
 {
+	autofreestrvbuilder StrvBuilder builder = {0};
+	const char *first = "first string";
+	strv_builder_add(&builder, first);
+	assert(builder.length == 1 && builder.strv[0] == first &&
+	       builder.strv[1] == NULL);
+	strv_builder_add(&builder, "");
+	for (size_t i = 0; i < 128; i++) {
+		strv_builder_add(&builder, first);
+		assert(builder.strv[builder.length] == NULL);
+	}
+	assert(builder.length == 130 && !strcmp(builder.strv[1], ""));
+	for (size_t i = 2; i < builder.length; i++)
+		assert(builder.strv[i] == first);
+	strv_builder_clear(&builder);
+	assert(builder.strv == NULL && builder.length == 0 && builder.capacity == 0);
+	strv_builder_add(&builder, first);
+	assert(builder.length == 1 && builder.strv[0] == first &&
+	       builder.strv[1] == NULL);
+
 	char filename[] = "/tmp/qm-utils-XXXXXX";
 	autoclose int fd = mkstemp(filename);
 	assert(fd >= 0);

@@ -39,7 +39,6 @@
 
 #define DEFAULT_RUNTIME_DIR "/run/qm"
 #define CRUN "/usr/bin/crun"
-#define CRUN_PREFIX_ARGS 4
 
 typedef enum {
 	COMMAND_LAUNCH,
@@ -71,15 +70,13 @@ static void debug(const char *format, ...)
 }
 
 /* Global crun options must precede the subcommand. */
-static size_t crun_prefix(char **argv, const char *executable, const char *root)
+static void crun_prefix(StrvBuilder *argv, const char *executable, const char *root)
 {
-	size_t index = 0;
-	argv[index++] = (char *)executable;
+	strv_builder_add(argv, executable);
 	if (opt_verbose)
-		argv[index++] = "--debug";
-	argv[index++] = "--root";
-	argv[index++] = (char *)root;
-	return index;
+		strv_builder_add(argv, "--debug");
+	strv_builder_add(argv, "--root");
+	strv_builder_add(argv, root);
 }
 
 static NetworkOptions get_network_options(const Config *configuration)
@@ -126,14 +123,13 @@ static int crun_delete(const State *state)
 	}
 
 	debug("Deleting container %s with %s (state root %s)", id, executable, root);
-	char *argv[CRUN_PREFIX_ARGS + 4];
-	size_t index = crun_prefix(argv, executable, root);
-	argv[index++] = "delete";
-	argv[index++] = "--force";
-	argv[index++] = (char *)id;
-	argv[index] = NULL;
+	autofreestrvbuilder StrvBuilder argv = {0};
+	crun_prefix(&argv, executable, root);
+	strv_builder_add(&argv, "delete");
+	strv_builder_add(&argv, "--force");
+	strv_builder_add(&argv, id);
 
-	return run_command(argv);
+	return run_command(argv.strv);
 }
 
 static int teardown_namespace(const char *netns)
@@ -369,25 +365,24 @@ static int crun_run(json_object *config)
 		if (console_pid < 0)
 			return 1;
 	}
-	char *argv[CRUN_PREFIX_ARGS + 8];
-	size_t index = crun_prefix(argv, CRUN, crun_state);
-	argv[index++] = "--cgroup-manager=cgroupfs";
-	argv[index++] = "run";
-	argv[index++] = "--bundle";
-	argv[index++] = (char *)opt_runtime_dir;
+	autofreestrvbuilder StrvBuilder argv = {0};
+	crun_prefix(&argv, CRUN, crun_state);
+	strv_builder_add(&argv, "--cgroup-manager=cgroupfs");
+	strv_builder_add(&argv, "run");
+	strv_builder_add(&argv, "--bundle");
+	strv_builder_add(&argv, opt_runtime_dir);
 	if (console_socket) {
-		argv[index++] = "--console-socket";
-		argv[index++] = console_socket;
+		strv_builder_add(&argv, "--console-socket");
+		strv_builder_add(&argv, console_socket);
 	}
-	argv[index++] = QM_CONTAINER_ID;
-	argv[index] = NULL;
+	strv_builder_add(&argv, QM_CONTAINER_ID);
 	notify_socket = getenv("NOTIFY_SOCKET");
 	debug("Starting container %s with %s (bundle %s, state root %s, "
 	      "NOTIFY_SOCKET=%s)",
 	      QM_CONTAINER_ID, CRUN, opt_runtime_dir, crun_state,
 	      notify_socket ? notify_socket : "(unset)");
 
-	execv(CRUN, argv);
+	execv(CRUN, argv.strv);
 	warn("exec %s", CRUN);
 	if (console_pid > 0) {
 		kill(console_pid, SIGTERM);
@@ -400,23 +395,19 @@ static int crun_run(json_object *config)
 static int exec_in_container(void)
 {
 	autofree char *crun_state = join_path(opt_runtime_dir, "crun");
-	size_t command_count = 0;
-	while (opt_exec_argv[command_count])
-		command_count++;
-
-	autofree char **argv =
-		xmalloc((CRUN_PREFIX_ARGS + command_count + 5) * sizeof(*argv));
-	size_t index = crun_prefix(argv, CRUN, crun_state);
-	argv[index++] = "--cgroup-manager=cgroupfs";
-	argv[index++] = "exec";
+	autofreestrvbuilder StrvBuilder argv = {0};
+	crun_prefix(&argv, CRUN, crun_state);
+	strv_builder_add(&argv, "--cgroup-manager=cgroupfs");
+	strv_builder_add(&argv, "exec");
 	if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO))
-		argv[index++] = "--tty";
-	argv[index++] = (char *)QM_CONTAINER_ID;
-	memcpy(argv + index, opt_exec_argv, (command_count + 1) * sizeof(*argv));
+		strv_builder_add(&argv, "--tty");
+	strv_builder_add(&argv, QM_CONTAINER_ID);
+	for (size_t i = 0; opt_exec_argv[i]; i++)
+		strv_builder_add(&argv, opt_exec_argv[i]);
 
 	debug("Executing %s in container %s with %s", opt_exec_argv[0], QM_CONTAINER_ID,
 	      CRUN);
-	execv(CRUN, argv);
+	execv(CRUN, argv.strv);
 	warn("exec %s", CRUN);
 
 	return 1;

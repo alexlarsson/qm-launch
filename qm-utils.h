@@ -47,6 +47,21 @@ char *xasprintf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 #define xnew(type) ((type *)xmalloc(sizeof(type)))
 
+/* Builds an allocated NULL-terminated vector, borrowing strings.
+ * Initialize to {0}. Each add requires a non-NULL string and grows the array
+ * as needed. Clear frees the array, leaving the borrowed strings untouched.
+ */
+typedef struct {
+	char **strv;
+	size_t length;
+	size_t capacity;
+} StrvBuilder;
+
+void strv_builder_add(StrvBuilder *builder, const char *string);
+void strv_builder_clear(StrvBuilder *builder);
+
+#define autofreestrvbuilder __attribute__((cleanup(strv_builder_clear)))
+
 bool starts_with(const char *string, const char *prefix);
 char *join_path(const char *a, const char *b);
 
