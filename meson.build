@@ -21,7 +21,8 @@ launcher_sources = [
   'qm-oci-config.c',
   'qm-seccomp.c',
 ]
-launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables')]
+launcher_deps = [dependency('json-c'), dependency('libmnl'), dependency('libnftables'),
+  dependency('libsystemd', version: '>=254')]
 launcher = executable('qmc', launcher_sources,
   dependencies: launcher_deps, install: true)
 

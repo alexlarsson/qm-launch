@@ -176,6 +176,23 @@ class ConfigTests(unittest.TestCase):
             for name in ["CHOWN", "SYS_RESOURCE"] * 20])
         self.assertEqual(loaded["unmask"], unmask)
 
+    def test_seat_operations_accumulate_across_layers(self):
+        self.write(self.vendor, "qmc.conf", {
+            "devices": [{"seat": "seat0", "optional": True}, {"seat": "seat1"}]})
+        self.write(self.admin, "qmc.conf", {
+            "devices": [{"seat": "seat0", "remove": True},
+                        {"destination": "/dev/input/event0", "remove": True}]})
+        self.write(self.admin, "qmc.conf.d/90-seat.conf", {
+            "devices": [{"seat": "seat0"}]})
+        result = self.load()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["path-operations"], [
+            {"kind": "devices", "seat": "seat0", "optional": True},
+            {"kind": "devices", "seat": "seat1"},
+            {"kind": "devices", "seat": "seat0", "remove": True},
+            {"kind": "devices", "destination": "/dev/input/event0", "remove": True},
+            {"kind": "devices", "seat": "seat0"}])
+
     def test_operation_order_follows_tables_instead_of_json_keys(self):
         self.write(self.vendor, "qmc.conf", {
             "devices": [{"remove": True, "destination": "/shared"}],
@@ -204,9 +221,18 @@ class ConfigTests(unittest.TestCase):
                           "options": ["bind", 1]}]}, "mounts[0].options[1] must be a JSON string"),
             ({"devices": [{"source": "/dev/null", "options": []}]},
              "unknown configuration.devices[0] key: options"),
+            ({"devices": [{"seat": None}]}, "devices[0].seat must be a JSON string"),
+            ({"devices": [{"seat": "seat0", "source": "/dev/null"}]},
+             "unknown configuration.devices[0] key: source"),
+            ({"devices": [{"seat": "seat0", "destination": "/dev/test"}]},
+             "unknown configuration.devices[0] key: destination"),
+            ({"devices": [{"seat": "seat0", "remove": True, "optional": True}]},
+             "unknown configuration.devices[0] key: optional"),
             ({"mounts": [{"destination": "/shared", "remove": True, "optional": False}]},
              "unknown configuration.mounts[0] key: optional"),
         ]
+        cases += [({"devices": [{"seat": seat}]}, "devices[0].seat is not a valid seat name")
+                  for seat in ("", "seat", "foo", "seat/0", "seat 0", "seat.0", "seat" + "0" * 252)]
         for settings, error in cases:
             with self.subTest(settings=settings):
                 path = self.write(self.vendor, "qmc.conf", settings)

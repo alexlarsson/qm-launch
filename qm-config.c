@@ -174,6 +174,19 @@ static void parse_hostname(void *field, json_object *value, const char *name,
 	replace_string(field, xstrdup(string));
 }
 
+static void parse_seat(void *field, json_object *value, const char *name,
+		       const char *filename)
+{
+	const char *string = config_string(value, name, filename);
+	if (!starts_with(string, "seat") || !string[4] || strlen(string) > 255 ||
+	    strspn(string, "abcdefghijklmnopqrstuvwxyz"
+			   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+			   "0123456789-_") != strlen(string))
+		errx(1, "%s: %s is not a valid seat name", filename, name);
+
+	replace_string(field, xstrdup(string));
+}
+
 static void parse_ipv4(void *field, json_object *value, const char *name,
 		       const char *filename)
 {
@@ -234,6 +247,7 @@ static void append_string(void *field, json_object *value, const char *name,
 
 static const ConfigParser path_parser = {json_type_string, parse_path, free};
 static const ConfigParser hostname_parser = {json_type_string, parse_hostname, free};
+static const ConfigParser seat_parser = {json_type_string, parse_seat, free};
 static const ConfigParser ipv4_parser = {json_type_string, parse_ipv4, free};
 static const ConfigParser prefix_parser = {json_type_int, parse_prefix_length, NULL};
 static const ConfigParser userns_parser = {json_type_string, parse_userns, NULL};
@@ -265,9 +279,21 @@ static const ConfigEntry removal_entries[] = {
 	CONFIG_ENTRY(PathOperation, "remove", remove, bool_parser),
 };
 
+static const ConfigEntry seat_entries[] = {
+	CONFIG_ENTRY(PathOperation, "seat", seat, seat_parser, .required = true),
+	CONFIG_ENTRY(PathOperation, "remove", remove, bool_parser),
+	CONFIG_ENTRY(PathOperation, "optional", optional, bool_parser),
+};
+
+static const ConfigEntry seat_removal_entries[] = {
+	CONFIG_ENTRY(PathOperation, "seat", seat, seat_parser, .required = true),
+	CONFIG_ENTRY(PathOperation, "remove", remove, bool_parser),
+};
+
 static void path_operation_free(void *data)
 {
 	clear_object(data, mount_entries, N_ELEMENTS(mount_entries));
+	clear_object(data, seat_entries, N_ELEMENTS(seat_entries));
 	free(data);
 }
 
@@ -292,9 +318,16 @@ static void parse_path_operation(PtrArray *operations, json_object *value, bool 
 {
 	bool remove = json_object_is_type(value, json_type_object) &&
 		      json_object_get_boolean(js_get(value, "remove"));
+	json_object *seat_value;
+	bool seat = device && json_object_is_type(value, json_type_object) &&
+		    json_object_object_get_ex(value, "seat", &seat_value);
 	const ConfigEntry *entries = mount_entries;
 	size_t count = N_ELEMENTS(mount_entries);
-	if (remove) {
+	if (seat) {
+		entries = remove ? seat_removal_entries : seat_entries;
+		count = remove ? N_ELEMENTS(seat_removal_entries)
+			       : N_ELEMENTS(seat_entries);
+	} else if (remove) {
 		entries = removal_entries;
 		count = N_ELEMENTS(removal_entries);
 	} else if (device) {
@@ -306,6 +339,9 @@ static void parse_path_operation(PtrArray *operations, json_object *value, bool 
 	*operation = (PathOperation){.device = device};
 	ptr_array_add(operations, operation);
 	parse_object(operation, value, entries, count, name, filename);
+
+	if (seat)
+		return;
 
 	if (!operation->destination)
 		operation->destination = xstrdup(operation->source);

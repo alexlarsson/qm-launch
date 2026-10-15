@@ -6,8 +6,9 @@ not flexible enough for any kind of generic use.
 
 Build and install:
 
-Build dependencies are a C compiler, Meson, json-c, libmnl and libnftables
-development files. Runtime dependencies include crun and QM.
+Build dependencies are a C compiler, Meson, json-c, libmnl, libnftables and
+libsystemd (version 254 or newer) development files. Runtime dependencies include
+crun and QM.
 
 ```sh
 meson setup build --prefix=/usr
@@ -125,6 +126,37 @@ Selections are expanded at startup; later host device changes are not tracked.
 
 For either kind, `optional: true` skips a missing source; for device selections,
 it also permits no matching devices. Other lookup errors still fail.
+
+Device objects can instead select a named seat with `{"seat": "seat0"}`.
+Seat entries accept `seat`, `optional` and `remove`; they have no `source`,
+`destination` or mount options. Names follow logind's seat naming rules: `seat`
+followed by one or more letters, digits, underscores or hyphens, up to 255 bytes
+in total. Discovery uses libsystemd's device API and the host udev database,
+including device-node descendants of seat-tagged parents. The nearest tagged
+ancestor determines membership; an absent or empty `ID_SEAT` means `seat0`.
+Selected nodes keep their normal paths and use the same metadata and cgroup
+handling as other device entries. `optional: true` permits an empty selection.
+
+Later entries for the same seat replace earlier selections;
+`{"seat": "seat0", "remove": true}` cancels an earlier selection. Multiple seat
+entries can select multiple seats. Individual selected nodes can also be overridden
+or removed by later destination operations, as with directory and glob selections.
+Seat membership is evaluated at startup, without hotplug or session management.
+
+The old QM seat hook also added common input and GPU render devices regardless of
+seat. To retain those additions, list them explicitly alongside the seat selector:
+
+```json
+{
+  "devices": [
+    {"seat": "seat0", "optional": true},
+    {"source": "/dev/input/event[0-9]*", "optional": true},
+    {"source": "/dev/input/mice*", "optional": true},
+    {"source": "/dev/input/mouse[0-9]*", "optional": true},
+    {"source": "/dev/dri/render*", "optional": true}
+  ]
+}
+```
 
 Container destination is the identity for mounts and devices. Later entries
 replace earlier requests at that destination, including entries of the other
@@ -401,7 +433,8 @@ without the QM rootfs or its SELinux policy. The systemd test checks
 notifications from services inside the container, readiness forwarded to
 the host, host machine-ID inheritance and committing an uninitialized ID. It uses
 `tests/seccomp-no-rt.json` and disables host subid detection for the live launch.
-Device and subid preparation tests use private `/dev` and `/etc` mounts:
+Device and subid preparation tests use private `/dev` and `/etc` mounts. Seat
+tests also mount a synthetic sysfs tree and udev database:
 
 ```sh
 systemd-run --user --service-type=exec --pipe --wait --collect --same-dir \

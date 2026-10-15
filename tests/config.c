@@ -15,7 +15,10 @@ static json_object *path_operations_json(const PtrArray *operations)
 		const PathOperation *operation = operations->items[i];
 		autofreejson json_object *entry = js_new_object();
 		js_set_string(entry, "kind", operation->device ? "devices" : "mounts");
-		js_set_string(entry, "destination", operation->destination);
+		if (operation->destination)
+			js_set_string(entry, "destination", operation->destination);
+		if (operation->seat)
+			js_set_string(entry, "seat", operation->seat);
 		if (operation->source)
 			js_set_string(entry, "source", operation->source);
 		if (operation->remove)

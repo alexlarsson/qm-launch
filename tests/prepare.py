@@ -85,6 +85,50 @@ class PrepareTests(unittest.TestCase):
                        "minor": expected["minor"], "access": "rwm"},
                       config["linux"]["resources"]["devices"])
 
+    def device_glob_fixture(self):
+        devices = self.directory / "devices"
+        devices.mkdir()
+        for name in ("null", "zero"):
+            (devices / name).symlink_to(f"/dev/{name}")
+        return devices
+
+    def seat_fixture(self):
+        """Use real sd-device enumeration against private sysfs/udev fixtures."""
+        sysfs = self.directory / "sysfs"
+        udev = self.directory / "udev"
+        for relative in ("class/input", "class/mem", "dev/char"):
+            (sysfs / relative).mkdir(parents=True)
+        (udev / "data").mkdir(parents=True)
+        (udev / "tags/seat").mkdir(parents=True)
+
+        for name, relative, seat in (("input0", "devices/input0", None),
+                                     ("input1", "devices/input0/input1", "seat1")):
+            device = sysfs / relative
+            device.mkdir(parents=True)
+            (device / "uevent").touch()
+            (device / "subsystem").symlink_to("/sys/class/input")
+            (sysfs / f"class/input/{name}").symlink_to(f"../../{relative}")
+            identity = f"+input:{name}"
+            (udev / "data" / identity).write_text(
+                "V:1\nG:seat\nQ:seat\n" + (f"E:ID_SEAT={seat}\n" if seat else ""))
+            (udev / "tags/seat" / identity).touch()
+
+        for name, parent, minor in (("null", "input0", 3), ("zero", "input0/input1", 5)):
+            relative = f"devices/{parent}/{name}"
+            device = sysfs / relative
+            device.mkdir()
+            (device / "uevent").write_text(f"MAJOR=1\nMINOR={minor}\nDEVNAME={name}\n")
+            (device / "subsystem").symlink_to("/sys/class/mem")
+            (sysfs / f"dev/char/1:{minor}").symlink_to(f"../../{relative}")
+
+        for source, destination in ((sysfs, "/sys"), (udev, "/run/udev")):
+            pathlib.Path(destination).mkdir(parents=True, exist_ok=True)
+            subprocess.run(["mount", "--bind", str(source), destination], check=True)
+            self.addCleanup(subprocess.run, ["umount", destination], check=True)
+
+        # sd-device's own test switch permits fixtures outside a sysfs filesystem.
+        return {**os.environ, "SYSTEMD_DEVICE_VERIFY_SYSFS": "0"}
+
     def test_static_config(self):
         result = self.prepare(hostname="qm-test")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -333,7 +377,9 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(config["resources"]["devices"].count(rule), 1)
 
     def test_device_globs_and_remapping(self):
-        for source, destination in [("/dev/nul?", None), ("/dev/[nz]*", "/dev/test")]:
+        devices = self.device_glob_fixture()
+        for pattern, destination in [("nul?", None), ("[nz]*", "/dev/test")]:
+            source = str(devices / pattern)
             with self.subTest(source=source):
                 operation = {"source": source}
                 if destination:
@@ -342,15 +388,16 @@ class PrepareTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 config = self.generated()
                 names = ["null", "zero"] if destination else ["null"]
+                prefix = destination or str(devices)
                 self.assertEqual([d["path"] for d in config["linux"]["devices"]],
-                                 [f"{destination or '/dev'}/{name}" for name in names])
+                                 [f"{prefix}/{name}" for name in names])
                 for name in names:
-                    self.assert_device(config, f"{destination or '/dev'}/{name}",
-                                       f"/dev/{name}")
+                    self.assert_device(config, f"{prefix}/{name}", f"/dev/{name}")
 
     def test_device_glob_overrides_and_removals(self):
+        devices = self.device_glob_fixture()
         result = self.prepare(settings={"devices": [
-            {"source": "/dev/[nz]*", "destination": "/dev/test"},
+            {"source": str(devices / "[nz]*"), "destination": "/dev/test"},
             {"source": "/dev/zero", "destination": "/dev/test/null"},
             {"destination": "/dev/test/zero", "remove": True}]})
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -370,14 +417,15 @@ class PrepareTests(unittest.TestCase):
         self.assert_device(self.generated(), "/dev/test", source)
 
     def test_later_device_glob_restores_an_earlier_removed_match(self):
+        devices = self.device_glob_fixture()
         for earlier in ({"destination": "/dev/test/null", "remove": True},
                         {"source": str(self.directory / "missing"),
                          "destination": "/dev/test/null"}):
             with self.subTest(earlier=earlier):
                 result = self.prepare(settings={"devices": [
-                    {"source": "/dev/nu*", "destination": "/dev/test"},
+                    {"source": str(devices / "nu*"), "destination": "/dev/test"},
                     earlier,
-                    {"source": "/dev/[nz]*", "destination": "/dev/test"}]})
+                    {"source": str(devices / "[nz]*"), "destination": "/dev/test"}]})
                 self.assertEqual(result.returncode, 0, result.stderr)
                 config = self.generated()
                 self.assert_device(config, "/dev/test/null", "/dev/null")
@@ -400,6 +448,75 @@ class PrepareTests(unittest.TestCase):
                     else:
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn(source, result.stderr)
+
+    def test_absent_and_cancelled_seat_selections(self):
+        seat = "seat-qmc-test-absent"
+        result = self.prepare(settings={"devices": [{"seat": seat}]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"no devices found for seat {seat}", result.stderr)
+
+        for devices in ([{"seat": seat, "optional": True}],
+                        [{"seat": seat}, {"seat": seat, "remove": True}]):
+            result = self.prepare(settings={"devices": devices})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self.generated()["linux"].get("devices"))
+            self.assertEqual(self.generated()["linux"]["resources"]["devices"],
+                             self.base["linux"]["resources"]["devices"])
+
+    @unittest.skipUnless(PRIVATE_PATHS, "requires private sysfs and udev database mounts")
+    def test_seat_devices_follow_parent_membership(self):
+        env = self.seat_fixture()
+        for seats, names in ((["seat0"], ["null"]), (["seat1"], ["zero"]),
+                             (["seat0", "seat1"], ["null", "zero"])):
+            with self.subTest(seats=seats):
+                result = self.prepare(settings={"devices": [{"seat": seat} for seat in seats]},
+                                      env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.generated()
+                self.assertEqual([d["path"] for d in config["linux"]["devices"]],
+                                 [f"/dev/{name}" for name in names])
+                for name in names:
+                    self.assert_device(config, f"/dev/{name}", f"/dev/{name}")
+
+        # Both tagged ancestors select zero, but it must only appear once.
+        (self.directory / "udev/data/+input:input1").write_text("V:1\nG:seat\nQ:seat\n")
+        result = self.prepare(settings={"devices": [{"seat": "seat0"}]}, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.generated()
+        self.assertEqual(sorted(d["path"] for d in config["linux"]["devices"]),
+                         ["/dev/null", "/dev/zero"])
+        self.assertEqual(len(config["linux"]["resources"]["devices"]),
+                         len(self.base["linux"]["resources"]["devices"]) + 2)
+
+    @unittest.skipUnless(PRIVATE_PATHS, "requires private sysfs and udev database mounts")
+    def test_seat_operations_and_individual_overrides(self):
+        env = self.seat_fixture()
+        cases = [
+            ([{"seat": "seat0"}, {"seat": "seat0", "remove": True}], []),
+            ([{"seat": "seat0"}, {"destination": "/dev/null", "remove": True}], []),
+            ([{"seat": "seat0"}, {"seat": "seat0", "remove": True}, {"seat": "seat1"}],
+             ["zero"]),
+            ([{"seat": "seat0"}, {"destination": "/dev/null", "remove": True},
+              {"seat": "seat0"}], ["null"]),
+            ([{"source": str(self.directory / "missing"), "destination": "/dev/null"},
+              {"seat": "seat0"}], ["null"]),
+        ]
+        for devices, names in cases:
+            with self.subTest(devices=devices):
+                result = self.prepare(settings={"devices": devices}, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = self.generated()
+                self.assertEqual([d["path"] for d in config["linux"].get("devices", [])],
+                                 [f"/dev/{name}" for name in names])
+                self.assertEqual(len(config["linux"]["resources"]["devices"]),
+                                 len(self.base["linux"]["resources"]["devices"]) + len(names))
+
+        result = self.prepare(settings={"devices": [
+            {"seat": "seat0"}, {"source": "/dev/zero", "destination": "/dev/null"}]}, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_device(self.generated(), "/dev/null", "/dev/zero")
+        self.assertFalse(any(r.get("allow") and r.get("minor") == 3
+                             for r in self.generated()["linux"]["resources"]["devices"]))
 
     def test_devices_and_mounts_share_destination_identity(self):
         self.base["mounts"].append({"destination": "/shared", "source": "tmpfs",

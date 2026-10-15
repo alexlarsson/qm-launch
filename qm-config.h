@@ -16,6 +16,7 @@ typedef enum { USERNS_AUTO, USERNS_OFF, USERNS_REQUIRED } UserNamespaceMode;
 typedef struct {
 	char *source;
 	char *destination;
+	char *seat; /* Alternative device selector; source and destination are NULL. */
 
 	bool device;
 	bool remove;

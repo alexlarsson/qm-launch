@@ -16,6 +16,7 @@ BuildRequires:  meson
 BuildRequires:  pkgconfig(json-c)
 BuildRequires:  pkgconfig(libmnl)
 BuildRequires:  pkgconfig(libnftables)
+BuildRequires:  pkgconfig(libsystemd) >= 254
 BuildRequires:  python3
 BuildRequires:  systemd-rpm-macros
 

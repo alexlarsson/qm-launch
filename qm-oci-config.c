@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <systemd/sd-device.h>
 
 static json_object *ensure_object(json_object *parent, const char *name)
 {
@@ -276,6 +277,99 @@ static void expand_devices(PtrArray *paths, const PathOperation *operation)
 		errx(1, "no devices found in %s", operation->source);
 }
 
+static bool device_on_seat(sd_device *device, const char *seat)
+{
+	/* Input and sound nodes can inherit membership from a tagged parent.
+	 * The nearest tagged device determines membership, including reassigned
+	 * subtrees below another seat's parent.
+	 */
+	for (;;) {
+		int r = sd_device_has_current_tag(device, "seat");
+		if (r < 0)
+			errx(1, "reading device tags for %s: %s", seat, strerror(-r));
+		if (r > 0) {
+			const char *name = NULL;
+			r = sd_device_get_property_value(device, "ID_SEAT", &name);
+			if (r < 0 && r != -ENOENT)
+				errx(1, "reading device seat for %s: %s", seat,
+				     strerror(-r));
+
+			return !strcmp(name && *name ? name : "seat0", seat);
+		}
+
+		r = sd_device_get_parent(device, &device);
+		if (r == -ENOENT)
+			return false;
+		if (r < 0)
+			errx(1, "reading device parent for %s: %s", seat, strerror(-r));
+	}
+}
+
+static sd_device_enumerator *device_enumerator_new(const char *seat)
+{
+	sd_device_enumerator *enumerator;
+	int r = sd_device_enumerator_new(&enumerator);
+	if (r < 0)
+		errx(1, "creating device enumerator for %s: %s", seat, strerror(-r));
+
+	r = sd_device_enumerator_allow_uninitialized(enumerator);
+	if (r < 0)
+		errx(1, "configuring device enumerator for %s: %s", seat, strerror(-r));
+
+	return enumerator;
+}
+
+static void expand_seat(PtrArray *paths, const PathOperation *operation)
+{
+	const char *seat = operation->seat;
+	sd_device_enumerator *seats = device_enumerator_new(seat);
+	int r = sd_device_enumerator_add_match_tag(seats, "seat");
+	if (r < 0)
+		errx(1, "selecting seat devices for %s: %s", seat, strerror(-r));
+
+	bool found = false;
+	for (sd_device *parent = sd_device_enumerator_get_device_first(seats); parent;
+	     parent = sd_device_enumerator_get_device_next(seats)) {
+		if (!device_on_seat(parent, seat))
+			continue;
+
+		sd_device_enumerator *children = device_enumerator_new(seat);
+		r = sd_device_enumerator_add_match_parent(children, parent);
+		if (r < 0)
+			errx(1, "selecting device children for %s: %s", seat,
+			     strerror(-r));
+
+		for (sd_device *device = sd_device_enumerator_get_device_first(children);
+		     device; device = sd_device_enumerator_get_device_next(children)) {
+			const char *name;
+			r = sd_device_get_devname(device, &name);
+			if (r == -ENOENT)
+				continue;
+			if (r < 0)
+				errx(1, "reading device node for %s: %s", seat,
+				     strerror(-r));
+			if (!device_on_seat(device, seat))
+				continue;
+
+			resolve_path(paths, operation, name, name, false);
+			found = true;
+		}
+		sd_device_enumerator_unref(children);
+	}
+	sd_device_enumerator_unref(seats);
+
+	if (!found && !operation->optional)
+		errx(1, "no devices found for seat %s", seat);
+}
+
+static bool same_path_request(const PathOperation *a, const PathOperation *b)
+{
+	if (a->seat || b->seat)
+		return a->seat && b->seat && !strcmp(a->seat, b->seat);
+
+	return !strcmp(a->destination, b->destination);
+}
+
 static void configure_paths(json_object *oci, const Config *config)
 {
 	if (!config->path_operations.length)
@@ -285,7 +379,9 @@ static void configure_paths(json_object *oci, const Config *config)
 	PtrArray resolved = {0};
 	for (size_t i = 0; i < config->path_operations.length; i++) {
 		const PathOperation *operation = config->path_operations.items[i];
-		resolve_path(&resolved, operation, NULL, operation->destination, true);
+		if (!operation->seat)
+			resolve_path(&resolved, operation, NULL, operation->destination,
+				     true);
 	}
 
 	/* Skip replaced requests before probing their sources, then expand the
@@ -296,11 +392,17 @@ static void configure_paths(json_object *oci, const Config *config)
 		size_t j;
 		for (j = i + 1; j < config->path_operations.length; j++) {
 			const PathOperation *later = config->path_operations.items[j];
-			if (!strcmp(later->destination, operation->destination))
+			if (same_path_request(later, operation))
 				break;
 		}
 		if (j < config->path_operations.length)
 			continue;
+
+		if (operation->seat) {
+			if (!operation->remove)
+				expand_seat(&resolved, operation);
+			continue;
+		}
 
 		if (operation->device && !operation->remove)
 			expand_devices(&resolved, operation);
